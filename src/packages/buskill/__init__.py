@@ -982,6 +982,32 @@ class BusKill:
 			# and fall-back on the default $HOME/.local/share
 			data_dirs.append( os.path.join( os.path.expanduser('~'), '.local', 'share' ) )
 
+		# When running as a frozen single-file PyInstaller exe, the APPS_DIR
+		# derived from EXE_PATH is unreliable. E.g. if the user drops
+		# buskill.exe in C:\Users\<them>\Downloads, the upstream code's
+		# EXE_PATH.split(os.sep)[0:-2] derivation makes APPS_DIR == "C:\Users",
+		# a system folder. Trying tempfile.TemporaryFile against C:\Users on
+		# Windows triggers a multi-minute hang in CPython's tempfile module:
+		# os.open() correctly fails with PermissionError, but os.access(W_OK)
+		# returns a false positive for system dirs, so _mkstemp_inner thinks
+		# it's a name collision and retries up to TMP_MAX (10000) times,
+		# with each retry getting throttled by Windows security checks.
+		#
+		# To dodge this, prefer the user's per-account data dir first when
+		# we're a frozen build. On Windows this is %LOCALAPPDATA%. The
+		# upstream-style APPS_DIR / APP_DIR probes are still kept as
+		# fallbacks for the upstream's --onedir install layout.
+		if getattr(sys, 'frozen', False):
+			if self.OS_NAME_SHORT == 'win':
+				local_appdata = os.environ.get('LOCALAPPDATA')
+				if local_appdata:
+					data_dirs.append( local_appdata )
+			elif self.OS_NAME_SHORT == 'mac':
+				data_dirs.append( os.path.join(
+				 os.path.expanduser('~'), 'Library', 'Application Support'
+				) )
+			# Linux already covered above via XDG_DATA_HOME / ~/.local/share
+
 		# first try to create our data dir in the same dir that holds the dir
 		# where the buskill app was installed (and where future updates will be
 		# installed). This may be the BusKill USB drive itself.
