@@ -65,6 +65,18 @@ random.shuffle(UPGRADE_MIRRORS)
 RELEASE_KEY_FINGERPRINT = 'E0AFFF57DC00FBE0563587614AE21E1936CE786A'
 RELEASE_KEY_SUB_FINGERPRINT = '798DC1101F3DEC428ADE124D68B8BCB0C5023905'
 
+####################
+# ONLYKEY CONSTANTS #
+####################
+
+# Restrict the hotplug-removal trigger so it only fires when an OnlyKey
+# (CryptoTrust) hardware token is unplugged, rather than any USB device.
+# Values verified via Windows PnP enumeration (USB\VID_1D50&PID_60FC).
+# Note: OnlyKey reports a generic USB serial ("1000000000") by design as a
+# privacy/anti-fingerprinting measure, so we filter on VID:PID only.
+ONLYKEY_VID = 0x1D50  # Openmoko, Inc. (shared open-hardware VID)
+ONLYKEY_PID = 0x60FC  # OnlyKey
+
 #####################
 # WINDOWS CONSTANTS #
 #####################
@@ -86,10 +98,24 @@ if CURRENT_PLATFORM.startswith( 'WIN' ):
 	DBT_DEVTYP_VOLUME = 0x00000002
 	DBT_DEVTYPE_PORT = 0x00000003
 	DBT_DEVTYPE_NET = 0x00000004
+	DBT_DEVTYP_DEVICEINTERFACE = 0x00000005
+
+	# RegisterDeviceNotification flags
+	DEVICE_NOTIFY_WINDOW_HANDLE = 0x00000000
 
 	# media types in DBT_DEVTYP_VOLUME
 	DBTF_MEDIA = 0x0001
 	DBTF_NET = 0x0002
+
+	# GUID_DEVINTERFACE_HID = {4D1E55B2-F16F-11CF-88CB-001111000030}
+	# This is the device-interface class GUID for HID devices. We pass it to
+	# RegisterDeviceNotification so Windows tells us about HID arrivals and
+	# removals (the existing DBT_DEVTYP_VOLUME path only fires for storage
+	# devices, which OnlyKey is not).
+	GUID_DEVINTERFACE_HID = (
+	 0x4D1E55B2, 0xF16F, 0x11CF,
+	 (0x88, 0xCB, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30),
+	)
 
 	WORD = c_ushort
 	DWORD = c_ulong
@@ -123,7 +149,31 @@ if CURRENT_PLATFORM.startswith( 'WIN' ):
 		 ("dbcv_unitmask", DWORD),
 		 ("dbcv_flags", WORD)
 		]
-	
+
+	# Win32 GUID layout, used by DEV_BROADCAST_DEVICEINTERFACE
+	class GUID(Structure):
+		_fields_ = [
+		 ("Data1", DWORD),
+		 ("Data2", WORD),
+		 ("Data3", WORD),
+		 ("Data4", c_byte * 8),
+		]
+
+	# DEV_BROADCAST_DEVICEINTERFACE_W
+	# The trailing dbcc_name is actually a variable-length null-terminated
+	# wide string. We declare a 1-char placeholder here so the struct is
+	# usable for RegisterDeviceNotification's filter (which only needs the
+	# fixed header), and we read the real name dynamically from memory in
+	# the callback using ctypes.wstring_at().
+	class DEV_BROADCAST_DEVICEINTERFACE(Structure):
+		_fields_ = [
+		 ("dbcc_size", DWORD),
+		 ("dbcc_devicetype", DWORD),
+		 ("dbcc_reserved", DWORD),
+		 ("dbcc_classguid", GUID),
+		 ("dbcc_name", c_wchar * 1),
+		]
+
 	def drive_from_mask(mask):
 		n_drive = 0
 		while 1:
@@ -160,7 +210,38 @@ if CURRENT_PLATFORM.startswith( 'WIN' ):
 			 0, 0,
 			 hinst, None
 			)
-	
+
+			# Register for HID device interface notifications.
+			#
+			# By default a hidden window only receives WM_DEVICECHANGE for
+			# volume (storage) changes. To be notified when an OnlyKey (HID)
+			# is unplugged, we have to register explicitly for the HID
+			# device-interface class.
+			RegisterDeviceNotification = windll.user32.RegisterDeviceNotificationW
+			RegisterDeviceNotification.argtypes = [c_void_p, c_void_p, DWORD]
+			RegisterDeviceNotification.restype = c_void_p
+
+			dbi = DEV_BROADCAST_DEVICEINTERFACE()
+			dbi.dbcc_size = sizeof(DEV_BROADCAST_DEVICEINTERFACE)
+			dbi.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE
+			dbi.dbcc_reserved = 0
+			dbi.dbcc_classguid = GUID(
+			 GUID_DEVINTERFACE_HID[0],
+			 GUID_DEVINTERFACE_HID[1],
+			 GUID_DEVINTERFACE_HID[2],
+			 (c_byte * 8)(*GUID_DEVINTERFACE_HID[3]),
+			)
+			self.hdev_notify = RegisterDeviceNotification(
+			 self.hwnd, byref(dbi), DEVICE_NOTIFY_WINDOW_HANDLE
+			)
+			if not self.hdev_notify:
+				msg = "ERROR: RegisterDeviceNotification (HID) failed; " \
+				 "OnlyKey removal will not be detected on this system"
+				print( msg ); logger.error( msg )
+			else:
+				msg = "DEBUG: Registered for HID device-interface notifications"
+				print( msg ); logger.debug( msg )
+
 		# this is a callback function that is registered to be called when a usb
 		# hotplug event occurs in windows
 		# WM_DEVICECHANGE:
@@ -169,40 +250,86 @@ if CURRENT_PLATFORM.startswith( 'WIN' ):
 		#    if it's a volume then...
 		#  lParam - what's changed more exactly
 		def hotplugCallbackWin(self, hwnd, message, wparam, lparam):
-			msg = "DEBUG: called hotplubCallbackWin()"
+			msg = "DEBUG: called hotplugCallbackWin()"
 			print( msg ); logger.debug( msg )
 
-			dev_broadcast_hdr = DEV_BROADCAST_HDR.from_address(lparam)
-	
-			if wparam == DBT_DEVICEREMOVECOMPLETE:
-				msg = "DEBUG: Determined USB hotplug event to be a removal"
-				print( msg ); logger.debug( msg )
+			# Only act on removal events.
+			if wparam != DBT_DEVICEREMOVECOMPLETE:
+				return 1
 
+			# Simulation path: armWin() calls us directly with lparam='simulation'
+			# to exercise the trigger without an actual USB unplug. In that case
+			# lparam isn't a valid memory address, so skip the parse and just
+			# enqueue the trigger.
+			if lparam == 'simulation':
+				msg = "DEBUG: Simulated USB removal; enqueueing trigger"
+				print( msg ); logger.debug( msg )
 				self.bk.usb_handler_queue.put( 'trigger' )
-	
-				msg = "hwnd:|" +str(hwnd)+ "|"
-				print( msg ); logger.debug( msg )
+				return 1
 
-				msg = "message:|" +str(message)+ "|"
-				print( msg ); logger.debug( msg )
+			# Inspect the device type. We only care about HID device-interface
+			# removals (which is what OnlyKey unplugs look like). Volume
+			# removals (mass-storage USB drives) are ignored.
+			try:
+				dev_broadcast_hdr = DEV_BROADCAST_HDR.from_address(lparam)
+			except Exception as e:
+				msg = "WARNING: Could not read DEV_BROADCAST_HDR: " +str(e)
+				print( msg ); logger.warning( msg )
+				return 1
 
-				msg= "wparam:|" +str(wparam)+ "|"
+			if dev_broadcast_hdr.dbch_devicetype != DBT_DEVTYP_DEVICEINTERFACE:
+				msg = "DEBUG: Ignoring non-device-interface removal " \
+				 "(devicetype=" +str(dev_broadcast_hdr.dbch_devicetype)+ ")"
 				print( msg ); logger.debug( msg )
+				return 1
 
-				msg = "lparam:|" +str(lparam)+ "|"
-				print( msg ); logger.debug( msg )
-	
-				dev_broadcast_volume = DEV_BROADCAST_VOLUME.from_address(lparam)
-				msg = "dev_broadcast_volume:|" +str(dev_broadcast_volume)+ "|"
-				print( msg ); logger.debug( msg )
+			# Read the variable-length dbcc_name out of the broadcast struct.
+			# dbcc_name is a wide null-terminated string sitting immediately
+			# after the fixed header. Its format is:
+			#   \\?\HID#VID_1D50&PID_60FC&MI_01#7&1e6b0599&0&0000#{guid}
+			name_offset = sizeof(DEV_BROADCAST_DEVICEINTERFACE) - sizeof(c_wchar)
+			try:
+				device_name = wstring_at(lparam + name_offset)
+			except Exception as e:
+				msg = "WARNING: Could not read dbcc_name: " +str(e)
+				print( msg ); logger.warning( msg )
+				return 1
 
-				drive_letter = drive_from_mask(dev_broadcast_volume.dbcv_unitmask)
-				msg = "drive_letter:|" +str(drive_letter)+ "|"
-				print( msg ); logger.debug( msg )
+			msg = "DEBUG: HID removal dbcc_name:|" +str(device_name)+ "|"
+			print( msg ); logger.debug( msg )
 
-				msg = "ch( ord('A') + drive_letter):|" +str( chr(ord('A') + drive_letter) )+ '|'
+			# Parse VID and PID out of the device path.
+			vid_match = re.search( r'VID_([0-9A-Fa-f]{4})', device_name )
+			pid_match = re.search( r'PID_([0-9A-Fa-f]{4})', device_name )
+			if not vid_match or not pid_match:
+				msg = "DEBUG: dbcc_name had no VID/PID; ignoring"
 				print( msg ); logger.debug( msg )
-	
+				return 1
+
+			removed_vid = int( vid_match.group(1), 16 )
+			removed_pid = int( pid_match.group(1), 16 )
+			msg = "DEBUG: Removed device VID:PID = " \
+			 +format(removed_vid, '04X')+ ":" +format(removed_pid, '04X')
+			print( msg ); logger.debug( msg )
+
+			if removed_vid != ONLYKEY_VID or removed_pid != ONLYKEY_PID:
+				msg = "DEBUG: Ignoring removal; not an OnlyKey " \
+				 "(expected " +format(ONLYKEY_VID, '04X')+ ":" \
+				 +format(ONLYKEY_PID, '04X')+ ")"
+				print( msg ); logger.debug( msg )
+				return 1
+
+			# OnlyKey was unplugged. Note: OnlyKey is a composite HID device
+			# with multiple interfaces (MI_00, MI_01, MI_02), so Windows will
+			# deliver this callback once per interface on a single physical
+			# unplug. Each will enqueue 'trigger'; the first one to be
+			# dequeued in the parent process fires the trigger and the rest
+			# are harmless no-ops (the screen is already locked, etc.).
+			msg = "INFO: Detected OnlyKey USB removal event (" \
+			 +str(device_name)+ ")"
+			print( msg ); logger.info( msg )
+			self.bk.usb_handler_queue.put( 'trigger' )
+
 			return 1
 
 class BusKill:
@@ -983,11 +1110,34 @@ class BusKill:
 		msg = "usb1.HOTPLUG_EVENT_DEVICE_LEFT:|" +str(usb1.HOTPLUG_EVENT_DEVICE_LEFT)+ "|"
 		print( msg ); logger.debug( msg )
 
-		# is this from a usb device being inserted or removed? 
+		# is this from a usb device being inserted or removed?
 		if event == usb1.HOTPLUG_EVENT_DEVICE_LEFT:
 			# this is a usb removal event
 
-			msg = "INFO: Detected USB removal event"
+			# Only trigger when the removed device is an OnlyKey. libusb1
+			# gives us the device's VID/PID even after the device has been
+			# unplugged (the USBDevice object holds the descriptor that was
+			# read at enumeration time), so we can filter here.
+			try:
+				removed_vid = device.getVendorID()
+				removed_pid = device.getProductID()
+			except Exception as e:
+				msg = "WARNING: Could not read VID/PID of removed device: " +str(e)
+				print( msg ); logger.warning( msg )
+				return
+
+			msg = "DEBUG: Removed device VID:PID = " \
+			 +format(removed_vid, '04X')+ ":" +format(removed_pid, '04X')
+			print( msg ); logger.debug( msg )
+
+			if removed_vid != ONLYKEY_VID or removed_pid != ONLYKEY_PID:
+				msg = "DEBUG: Ignoring removal; not an OnlyKey " \
+				 "(expected " +format(ONLYKEY_VID, '04X')+ ":" \
+				 +format(ONLYKEY_PID, '04X')+ ")"
+				print( msg ); logger.debug( msg )
+				return
+
+			msg = "INFO: Detected OnlyKey USB removal event"
 			print( msg ); logger.info( msg )
 
 			msg = "calling " +str(self.TRIGGER_FUNCTION)
