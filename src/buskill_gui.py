@@ -27,6 +27,16 @@ import os, sys, re, webbrowser, json
 import multiprocessing, threading
 from multiprocessing import util
 
+# Optional system-tray support. We import lazily and degrade gracefully if
+# either pystray or Pillow isn't available, so the GUI still works without it.
+try:
+	import pystray
+	from PIL import Image, ImageDraw
+	HAS_PYSTRAY = True
+except Exception as _pystray_err:
+	HAS_PYSTRAY = False
+	_PYSTRAY_IMPORT_ERROR = _pystray_err
+
 import logging
 logger = logging.getLogger( __name__ )
 util.get_logger().setLevel(util.DEBUG)
@@ -119,9 +129,15 @@ class MainWindow(Screen):
 		# add_widget()
 		self.bk = self.root_app.bk
 
-	# called to close the app
+	# called to close the app (from nav-drawer "Exit" menu, etc.)
+	# Route through the App's _tray_quit so the tray icon, the BusKill
+	# usb_handler child process, and Kivy all shut down cleanly.
 	def close( self, *args ):
-		sys.exit(0)
+		try:
+			App.get_running_app()._tray_quit()
+		except Exception:
+			# last-resort fallback if the App isn't running cleanly
+			sys.exit(0)
 
 	def toggle_menu(self):
 
@@ -1095,6 +1111,13 @@ class BusKillApp(App):
 		self.options = kwargs
 		self.built = False
 
+		# system-tray state
+		# _tray_icon is the running pystray.Icon (or None if tray unavailable)
+		# _exit_requested distinguishes "user clicked X (hide)" from "user
+		# clicked tray-Quit / nav-Exit (actually exit)"
+		self._tray_icon = None
+		self._exit_requested = False
+
 	# instantiate our scren manager instance so it can be accessed by other
 	# objects for changing the kivy screen
 	manager = ScreenManager()
@@ -1125,6 +1148,138 @@ class BusKillApp(App):
 	def close( self, *args ):
 		self.bk.close()
 
+	#######################
+	# SYSTEM-TRAY SUPPORT #
+	#######################
+
+	# Handler for the window's X button / Alt-F4.
+	#
+	# If pystray is up, we hide the window to the tray and keep BusKill
+	# armed in the background. Returning True from on_request_close tells
+	# Kivy NOT to actually close the window.
+	#
+	# If pystray isn't available (import failed) or the user already chose
+	# Quit via the tray/nav menu, we fall through to the normal close path.
+	def _on_request_close( self, *args, **kwargs ):
+
+		if self._exit_requested:
+			# user explicitly asked to quit; let Kivy close normally
+			self.close()
+			return False
+
+		if self._tray_icon is not None:
+			msg = "DEBUG: X clicked - hiding to tray; BusKill stays armed"
+			print( msg ); logger.debug( msg )
+			try:
+				Window.hide()
+			except Exception as e:
+				msg = "WARNING: Window.hide() failed: " +str(e)
+				print( msg ); logger.warning( msg )
+				# fall through to normal close
+				self.close()
+				return False
+			return True
+
+		# no tray; behave like before
+		self.close()
+		return False
+
+	# Build a Pillow Image to use as the tray icon. Prefers the project's
+	# bundled icon (buskill-icon-150.png) and falls back to a drawn one
+	# if the file can't be located.
+	def _make_tray_icon_image( self ):
+
+		# look near the source/exe for the bundled icon
+		candidates = [
+		 'buskill-icon-150.png',
+		 os.path.join( self.bk.EXE_DIR, 'buskill-icon-150.png' ),
+		 os.path.join( self.bk.SRC_DIR, 'buskill-icon-150.png' ),
+		]
+		for path in candidates:
+			try:
+				if path and os.path.exists( path ):
+					return Image.open( path )
+			except Exception:
+				pass
+
+		# fallback: simple drawn icon (blue square with a light bar)
+		img = Image.new( 'RGB', (64, 64), color=(20, 60, 120) )
+		draw = ImageDraw.Draw( img )
+		draw.rectangle( [10, 24, 54, 40], fill=(220, 220, 220) )
+		return img
+
+	def _setup_tray( self ):
+
+		try:
+			icon_img = self._make_tray_icon_image()
+			menu = pystray.Menu(
+			 pystray.MenuItem( 'Show BusKill', self._tray_show, default=True ),
+			 pystray.MenuItem( 'Toggle Arm/Disarm', self._tray_toggle ),
+			 pystray.Menu.SEPARATOR,
+			 pystray.MenuItem( 'Quit', self._tray_quit ),
+			)
+			self._tray_icon = pystray.Icon(
+			 'buskill', icon_img, 'BusKill (OnlyKey)', menu
+			)
+			# pystray.Icon.run() blocks, so it goes in its own thread.
+			# daemon=True so it dies if the main process is killed.
+			t = threading.Thread( target=self._tray_icon.run, daemon=True )
+			t.start()
+			msg = "DEBUG: tray icon started"
+			print( msg ); logger.debug( msg )
+		except Exception as e:
+			msg = "WARNING: tray icon setup failed: " +str(e)
+			print( msg ); logger.warning( msg )
+			self._tray_icon = None
+
+	# Tray menu callbacks run on the pystray thread, NOT Kivy's main
+	# thread. We must hop back to Kivy's main thread for any UI work,
+	# which Clock.schedule_once handles.
+
+	def _tray_show( self, icon=None, item=None ):
+		Clock.schedule_once( lambda dt: Window.show(), 0 )
+
+	def _tray_toggle( self, icon=None, item=None ):
+		def do_toggle( dt ):
+			try:
+				main_screen = self.manager.get_screen('main')
+				main_screen.toggle_buskill()
+			except Exception as e:
+				msg = "WARNING: tray toggle failed: " +str(e)
+				print( msg ); logger.warning( msg )
+		Clock.schedule_once( do_toggle, 0 )
+
+	def _tray_quit( self, icon=None, item=None ):
+		msg = "INFO: Quit requested (tray/nav menu)"
+		print( msg ); logger.info( msg )
+		self._exit_requested = True
+
+		# stop the tray icon (safe to call from the pystray thread itself)
+		if self._tray_icon is not None:
+			try:
+				self._tray_icon.stop()
+			except Exception as e:
+				msg = "WARNING: tray stop failed: " +str(e)
+				print( msg ); logger.warning( msg )
+
+		# clean up bk (kills usb_handler child) and stop Kivy on its thread
+		def do_quit( dt ):
+			try:
+				self.close()
+			except Exception:
+				pass
+			self.stop()
+		Clock.schedule_once( do_quit, 0 )
+
+	# Belt-and-suspenders: ensure the tray thread dies if Kivy stops for
+	# any other reason (e.g. someone calls App.stop() directly).
+	def on_stop( self ):
+		if self._tray_icon is not None:
+			try:
+				self._tray_icon.stop()
+			except Exception:
+				pass
+
 	def build_config(self, config):
 
 		Config.read( self.bk.CONF_FILE )
@@ -1146,7 +1301,21 @@ class BusKillApp(App):
 		if self.bk.IS_PLATFORM_SUPPORTED:
 
 			# yes, this platform is supported; show the main window
-			Window.bind( on_request_close = self.close )
+			# X-button (and Alt-F4) now route through _on_request_close,
+			# which hides the window to the tray when tray is available.
+			# Real exit happens via the tray-Quit menu item or the
+			# nav-drawer Exit menu (both call _tray_quit).
+			Window.bind( on_request_close = self._on_request_close )
+
+			# spin up the tray icon shortly after Kivy initializes the
+			# window. delayed slightly so Window.hide() works reliably
+			# when the user immediately clicks X.
+			if HAS_PYSTRAY:
+				Clock.schedule_once( lambda dt: self._setup_tray(), 0.5 )
+			else:
+				msg = "WARNING: pystray/Pillow not available; X-button will exit (no tray): " \
+				 +str(_PYSTRAY_IMPORT_ERROR)
+				print( msg ); logger.warning( msg )
 
 			# create all the Screens we need for our app
 			screens = [

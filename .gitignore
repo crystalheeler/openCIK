@@ -3,3 +3,16 @@ __pycache__
 *.swp
 /dist
 .DS_Store
+
+# Local dev venv used by build/windows/buildExe-onlykey.ps1
+venv/
+
+# Runtime data dirs created by the app
+.buskill/
+build/.buskill/
+
+# PyInstaller intermediate/output dirs and logs (release artifacts go to
+# GitHub Releases, not the repo)
+build/windows/build/
+build/windows/dist/
+build/windows/build.log

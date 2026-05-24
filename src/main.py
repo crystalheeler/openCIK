@@ -19,10 +19,20 @@ For more info, see: https://buskill.in/
 
 # this is needed for supporting Windows 10 with OpenGL < v2.0
 # Example: VirtualBox w/ OpenGL v1.1
-import platform, os
+import platform, os, sys
 CURRENT_PLATFORM = platform.system().upper()
 if CURRENT_PLATFORM.startswith( 'WIN' ):
     os.environ['KIVY_GL_BACKEND'] = 'angle_sdl2'
+
+# When running as a PyInstaller --onefile bundle, the extracted resources
+# (fonts, images, the .kv file, packages/, etc.) live under sys._MEIPASS,
+# not the current working directory. Kivy uses relative paths to register
+# fonts/icons (e.g. LabelBase.register("Roboto", "fonts/Roboto-Regular.ttf")),
+# so without chdir-ing here we'd get
+#   OSError: File fonts\Roboto-Regular.ttf not found
+# Has no effect when running from source.
+if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+    os.chdir(sys._MEIPASS)
 
 ################################################################################
 #                                   IMPORTS                                    #
