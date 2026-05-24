@@ -47,9 +47,25 @@ $env:SOURCE_DATE_EPOCH = (git log -1 --pretty=%ct).Trim()
 $gitSha    = (git rev-parse HEAD).Trim()
 $gitRef    = (git symbolic-ref HEAD 2>$null)
 if (-not $gitRef) { $gitRef = 'detached' } else { $gitRef = $gitRef.Trim() }
-$verBranch = $gitRef.Split('/')[-1]
 $shortSha  = $gitSha.Substring(0, 8)
-$version   = "$verBranch-$shortSha-onlykey"
+
+# Prefer an exact-match tag (e.g. when we build a tagged release like
+# v1.0.0-openCIK), then `git describe`, then fall back to branch+sha. This
+# gives release builds a clean version string and unreleased builds something
+# still useful for debugging.
+$tagExact = (git describe --tags --exact-match HEAD 2>$null)
+if ($LASTEXITCODE -eq 0 -and $tagExact) {
+    $version = $tagExact.Trim()
+} else {
+    $described = (git describe --tags --always --dirty 2>$null)
+    if ($LASTEXITCODE -eq 0 -and $described) {
+        $version = $described.Trim()
+    } else {
+        $verBranch = $gitRef.Split('/')[-1]
+        $version   = "$verBranch-$shortSha-onlykey"
+    }
+}
+$LASTEXITCODE = 0  # reset; git describe miss is not a build failure
 
 $verContent = @"
 # -*- mode: python ; coding: utf-8 -*-
