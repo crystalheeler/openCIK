@@ -16,3 +16,8 @@ build/.buskill/
 build/windows/build/
 build/windows/dist/
 build/windows/build.log
+
+# Buildozer / python-for-android intermediate and output dirs
+# (.buildozer/ holds the downloaded Android SDK+NDK, ~3GB)
+android/.buildozer/
+android/bin/
