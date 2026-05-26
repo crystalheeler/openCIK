@@ -16,7 +16,7 @@ source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,ttf
 
 # (str) Application versioning (method 1)
-version = 0.3.1
+version = 0.4.1
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy
@@ -34,6 +34,19 @@ requirements = python3,kivy,pyjnius
 # The 'monitor' entry generates a Java class
 # io.crystalheeler.opencik.ServiceMonitor which we start from main.py.
 services = monitor:service/monitor.py:foreground
+
+# (str) Java source directory to compile alongside p4a's generated code.
+# Used to ship our DeviceAdminReceiver subclass (M4) and any other
+# Java glue. Path is relative to source.dir (=android/). Mirrors
+# normal Java package conventions:
+#   java/io/crystalheeler/opencik/AdminReceiver.java
+android.add_src = java
+
+# Note: we DON'T use android.add_resources for res/xml/device_admin.xml.
+# p4a's --add-resource <path>:xml takes the second token as the destination
+# *filename* (not subdirectory) and writes the XML at res/xml, clobbering
+# the xml/ directory. Our patches/inject-admin-receiver.py copies the
+# resource into res/xml/device_admin.xml manually, avoiding this bug.
 
 # (str) Supported orientations
 # Valid options are: landscape, portrait, portrait-reverse or landscape-reverse

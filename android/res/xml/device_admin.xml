@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Device-admin policies for openCIK's AdminReceiver.
+
+  Declaring a policy here doesn't grant it; the user grants it once
+  via the system Settings UI when we send ACTION_ADD_DEVICE_ADMIN.
+
+  We declare BOTH force-lock and wipe-data up front so the grant
+  flow only has to happen once. The user won't be asked again when
+  we later turn wipe on. (You can't add policies after grant
+  without re-prompting.)
+-->
+<device-admin xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-policies>
+        <!-- DevicePolicyManager.lockNow()        — M4 -->
+        <force-lock />
+        <!-- DevicePolicyManager.wipeData()       — M7 -->
+        <wipe-data />
+    </uses-policies>
+</device-admin>
