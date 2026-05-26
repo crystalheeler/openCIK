@@ -138,19 +138,6 @@ def request_admin():
         return False, msg
 
 
-def lock_now():
-    """Lock the device immediately via DevicePolicyManager."""
-    if not _is_android():
-        return False
-    try:
-        dpm = get_device_policy_manager()
-        dpm.lockNow()
-        return True
-    except Exception as e:
-        print(f'[opencik] lock_now failed: {e!r}')
-        return False
-
-
 def request_notification_permission():
     if not _is_android():
         return
@@ -262,25 +249,14 @@ class OpenCikRoot(BoxLayout):
         )
         self.add_widget(self.admin_label)
 
-        # Container for admin/test buttons (so we can hide them dynamically)
-        self.action_row = BoxLayout(
-            orientation='horizontal',
-            spacing=8,
-            size_hint=(1, 0.08),
-        )
+        # Grant device admin button (only visible when admin not granted)
         self.grant_button = Button(
             text='Grant device admin',
             font_size='14sp',
+            size_hint=(1, 0.08),
         )
         self.grant_button.bind(on_release=self._on_grant)
-        self.test_lock_button = Button(
-            text='Test lock now',
-            font_size='14sp',
-        )
-        self.test_lock_button.bind(on_release=lambda _b: lock_now())
-        self.action_row.add_widget(self.grant_button)
-        self.action_row.add_widget(self.test_lock_button)
-        self.add_widget(self.action_row)
+        self.add_widget(self.grant_button)
 
         # --- service / hint line ---
         self.svc_label = Label(
@@ -413,11 +389,11 @@ class OpenCikRoot(BoxLayout):
             self.admin_label.text = 'Device admin: NOT GRANTED'
             self.admin_label.color = COLOR_AMBER
 
-        # Show grant button only when not granted; test-lock only when granted
+        # Show grant button only when not granted (height collapses too,
+        # via a size_hint trick: 0.08 when visible, 0.001 when hidden)
         self.grant_button.opacity = 0 if admin else 1
         self.grant_button.disabled = admin
-        self.test_lock_button.opacity = 1 if admin else 0
-        self.test_lock_button.disabled = not admin
+        self.grant_button.size_hint = (1, 0.001 if admin else 0.08)
 
         # --- svc status freshness ---
         if self._status is None:

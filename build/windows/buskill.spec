@@ -46,6 +46,9 @@ a = Analysis(
         'win32api', 'win32con', 'win32gui',
         # pystray's Windows backend
         'pystray._win32',
+        # hidapi — used in buskill_gui.py for the live OnlyKey-present
+        # indicator and precondition-gating the Arm button
+        'hid',
         # garden modules are imported as packages.garden.* in buskill_gui.py
         'packages.garden.navigationdrawer',
         'packages.garden.progressspinner',

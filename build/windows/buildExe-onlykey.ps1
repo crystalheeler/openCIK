@@ -15,7 +15,7 @@
 #            python -m venv venv
 #            .\venv\Scripts\python.exe -m pip install `
 #              pywin32 certifi python-gnupg `
-#              "kivy[base]" pystray Pillow pyinstaller
+#              "kivy[base]" pystray Pillow hidapi pyinstaller
 ################################################################################
 
 # NOTE on ErrorActionPreference: PyInstaller writes its INFO/WARNING progress

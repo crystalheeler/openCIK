@@ -41,6 +41,7 @@
 	actionview: actionview
 	toggle_btn: toggle_btn
 	status: status
+	onlykey_status: onlykey_status
 	nav_drawer: nav_drawer
 
 	BoxLayout:
@@ -157,10 +158,24 @@
 					pos_hint: {'center_x': 0.5, 'top': 1}
 					spacing: 10
 
+					# Live OnlyKey-present indicator. Polled at 1 Hz from
+					# MainWindow._poll_onlykey(). Matches the Android UI's
+					# headline state so both platforms tell you up-front
+					# whether arming will work right now.
 					Label:
-						id: status 
+						id: onlykey_status
+						text: "OnlyKey: checking..."
+						size_hint: (1, 1)
+						text_size: self.size
+						halign: 'center'
+						valign: 'middle'
+						font_name: "RobotoMedium"
+						font_size: 20
+
+					Label:
+						id: status
 						text: "BusKill is disarmed."
-						size_hint: (1,2)
+						size_hint: (1, 1)
 						text_size: self.size
 						halign: 'center'
 						valign: 'middle'

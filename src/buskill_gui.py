@@ -37,6 +37,23 @@ except Exception as _pystray_err:
 	HAS_PYSTRAY = False
 	_PYSTRAY_IMPORT_ERROR = _pystray_err
 
+# Optional live USB enumeration (for the OnlyKey-present indicator and
+# precondition-gating the Arm button). Mirrors what the Android UI does
+# via UsbManager. Degrades gracefully if hidapi isn't installed — the UI
+# just won't show the indicator and the Arm button will work as before
+# (any-USB-removal triggers, no precondition check).
+try:
+	import hid
+	HAS_HIDAPI = True
+except Exception as _hid_err:
+	HAS_HIDAPI = False
+	_HID_IMPORT_ERROR = _hid_err
+
+# OnlyKey USB identifiers (replicated from packages/buskill/__init__.py
+# for use in the UI without circular imports)
+ONLYKEY_VID = 0x1D50
+ONLYKEY_PID = 0x60FC
+
 import logging
 logger = logging.getLogger( __name__ )
 util.get_logger().setLevel(util.DEBUG)
@@ -103,11 +120,17 @@ class MainWindow(Screen):
 
 	toggle_btn = ObjectProperty(None)
 	status = ObjectProperty(None)
+	onlykey_status = ObjectProperty(None)
 	menu = ObjectProperty(None)
 	actionview = ObjectProperty(None)
 	actionbar = ObjectProperty(None)
 
 	dialog = None
+
+	# Most recent OnlyKey-present reading from the 1 Hz poll. None until
+	# the first poll runs. Used to decide whether the Arm button should
+	# be enabled.
+	_onlykey_present = None
 
 	def __init__(self, **kwargs):
 
@@ -129,6 +152,14 @@ class MainWindow(Screen):
 		# add_widget()
 		self.bk = self.root_app.bk
 
+		# Kick off the OnlyKey-present poll. 1 Hz is plenty for UI
+		# feedback. The actual hotplug trigger detection runs in the
+		# child usb_handler process at the OS event level, not here.
+		# Idempotent — calling schedule_interval twice on the same
+		# bound method is a no-op (Kivy dedupes).
+		self._poll_onlykey(0)
+		Clock.schedule_interval( self._poll_onlykey, 1.0 )
+
 	# called to close the app (from nav-drawer "Exit" menu, etc.)
 	# Route through the App's _tray_quit so the tray icon, the BusKill
 	# usb_handler child process, and Kivy all shut down cleanly.
@@ -144,6 +175,23 @@ class MainWindow(Screen):
 		self.nav_drawer.toggle_state()
 
 	def toggle_buskill(self):
+
+		# Pre-arm precondition check. Matches the Android UI: refuse to
+		# arm if the OnlyKey isn't currently plugged in, because the
+		# whole point is to detect its REMOVAL. Arming with no key
+		# attached would either trigger on the first random USB event
+		# (legacy any-USB behavior) or never trigger at all.
+		#
+		# We only enforce this when we actually have a reading from the
+		# poll. If HAS_HIDAPI is False or the poll hasn't completed yet,
+		# fall through to legacy behavior so the app doesn't silently
+		# refuse to work.
+		if not self.bk.is_armed and HAS_HIDAPI and self._onlykey_present is False:
+			self.status.text = (
+				"Can't arm: OnlyKey not detected.\n"
+				"Plug it in and try again."
+			)
+			return
 
 		self.bk.toggle()
 
@@ -176,6 +224,59 @@ class MainWindow(Screen):
 
 			# stop checking for messages from the usb_handler child process
 			Clock.unschedule( self.bk.check_usb_handler )
+
+	# Live OnlyKey-present poll (1 Hz). Mirrors the headline state in
+	# the Android UI. Updates onlykey_status text + color and dims the
+	# Arm button when the precondition isn't met. No-op if hidapi
+	# isn't available (the indicator will just stay on "checking...").
+	def _poll_onlykey( self, _dt ):
+
+		if not HAS_HIDAPI:
+			self.onlykey_status.text = "OnlyKey: (hidapi unavailable)"
+			self.onlykey_status.color = (0.7, 0.7, 0.7, 1)
+			return
+
+		try:
+			present = any(
+				d.get('vendor_id') == ONLYKEY_VID
+				and d.get('product_id') == ONLYKEY_PID
+				for d in hid.enumerate()
+			)
+		except Exception as e:
+			# Don't spam logs every poll — just on transitions
+			if self._onlykey_present is not False:
+				msg = "WARNING: hid.enumerate() failed: " +str(e)
+				print( msg ); logger.warning( msg )
+			present = False
+
+		# Avoid pointless UI churn when state hasn't changed
+		if present == self._onlykey_present:
+			return
+
+		self._onlykey_present = present
+
+		if present:
+			self.onlykey_status.text = "OnlyKey: PRESENT"
+			self.onlykey_status.color = (0.25, 0.85, 0.4, 1)
+		else:
+			self.onlykey_status.text = "OnlyKey: not detected"
+			self.onlykey_status.color = (1, 0.7, 0.25, 1)
+
+		# Reflect armability on the toggle button. We DON'T touch the
+		# button when armed (otherwise yanking the OnlyKey would dim
+		# the Disarm button mid-trigger, which is jarring and useless).
+		if not self.bk.is_armed:
+			self.toggle_btn.disabled = not present
+			# Subtle visual hint when the button can't be tapped
+			if present:
+				self.toggle_btn.background_color = self.color_primary
+			else:
+				self.toggle_btn.background_color = (
+					self.color_primary[0] * 0.4,
+					self.color_primary[1] * 0.4,
+					self.color_primary[2] * 0.4,
+					1,
+				)
 
 	def switchToScreen( self, screen ):
 		self.manager.current = screen
