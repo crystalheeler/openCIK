@@ -1,6 +1,6 @@
 [
 	{
-		"icon": "\uf0eb",
+		"icon": "",
 		"type": "complex-options",
 		"title": "Trigger",
 		"desc": "Choose what happens when BusKill's cable is disconnected",
@@ -9,6 +9,14 @@
 		"options": ["lock-screen", "soft-shutdown"],
 		"options_long": ["BusKill will lock your screen", "BusKill will immediately initiate a soft shutdown sequence, May cause data loss!"],
 		"confirmation": ["", "This selection may cause data loss! Are you sure you want to continue?\n\nThe 'soft-shutdown' trigger will immediately cause your computer to shutdown. This could cause you to lose work if, for example, you're writing an email or typing a text document.\n\nAre you sure you want to select the 'soft-shutdown' trigger, despite the risk of data loss?" ],
-		"options_icons": ["\ue1bf","\ue62a"]
+		"options_icons": ["",""]
+	},
+	{
+		"type": "options",
+		"title": "Trigger countdown",
+		"desc": "How many seconds to wait after BusKill detects the OnlyKey was unplugged, before firing the trigger. Re-plug within this window aborts. Audio beep on each second.",
+		"section": "buskill",
+		"key": "delay",
+		"options": ["0", "3", "5", "10"]
 	}
 ]

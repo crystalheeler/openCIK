@@ -16,7 +16,7 @@ source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,ttf
 
 # (str) Application versioning (method 1)
-version = 1.0.3
+version = 1.0.4
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy
@@ -67,7 +67,7 @@ fullscreen = 0
 #   mandatory persistent foreground-service notification
 # Later milestones will add: BIND_DEVICE_ADMIN (lock/wipe trigger),
 # RECEIVE_BOOT_COMPLETED (auto-arm at boot, optional).
-android.permissions = FOREGROUND_SERVICE, FOREGROUND_SERVICE_SPECIAL_USE, WAKE_LOCK, POST_NOTIFICATIONS
+android.permissions = FOREGROUND_SERVICE, FOREGROUND_SERVICE_SPECIAL_USE, WAKE_LOCK, POST_NOTIFICATIONS, VIBRATE
 
 # (int) Target Android API, should be as high as possible.
 android.api = 33

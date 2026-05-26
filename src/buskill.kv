@@ -123,6 +123,18 @@
 							root.manager.current = 'debug_log'
 
 					Button:
+						text: '[font=Roboto][size=24]  [/size][/font][font=mdicons][size=24]\ue897[/size][/font]     [font=RobotoMedium][size=16]PIN[/size][/font]'
+						markup: True
+						halign: 'left'
+						valign: 'center'
+						text_size: self.size
+						size_hint: 1, None
+						height: 50
+						background_normal: ''
+						background_color: root.color_menu_bg
+						on_release: root.manage_pin()
+
+					Button:
 						text: '[font=Roboto][size=24]  [/size][/font][font=mdicons][size=24]\ue88f[/size][/font]     [font=RobotoMedium][size=16]About[/size][/font]'
 						markup: True
 						halign: 'left'

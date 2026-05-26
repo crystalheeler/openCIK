@@ -18,9 +18,10 @@ For more info, see: https://buskill.in/
 #                                   IMPORTS                                    #
 ################################################################################
 
-import platform, multiprocessing, traceback, subprocess
+import platform, multiprocessing, traceback, subprocess, threading, time
 import urllib.request, re, json, certifi, sys, os, math, shutil, tempfile, random, gnupg, configparser
 import os.path
+import hashlib, secrets
 from buskill_version import BUSKILL_VERSION
 from distutils.version import LooseVersion
 from hashlib import sha256
@@ -374,6 +375,25 @@ class BusKill:
 		self.upgrade_status_msg = None
 		self.upgrade_result = None
 		self.trigger = None
+
+		# M5: countdown state. delay is the chosen per-arm window (sec)
+		# during which a re-plug aborts. countdown_active flips True when
+		# the trigger condition is detected but the delay hasn't expired
+		# yet. countdown_remaining is the live remaining count (sec) for
+		# the UI to render.
+		self.delay = 3
+		self.countdown_active = False
+		self.countdown_remaining = 0
+		self._countdown_aborted = False
+
+		# M7: independent trigger toggles. Replaces the legacy mutually-
+		# exclusive `self.trigger` string. We still read the legacy
+		# config value for backward compat in set_trigger(), then mirror
+		# it into triggers_enabled.
+		# On Android the equivalents are trig_lock / trig_wipe; here it's
+		# trig_lock / trig_shutdown (Windows can't factory-wipe).
+		self.triggers_enabled = set()
+		self.confirm_shutdown = False
 
 		self.SUPPORTED_TRIGGERS = ['lock-screen', 'soft-shutdown']
 		self.trigger_softshutdown_lin_shutdown_path = None
@@ -1199,13 +1219,177 @@ class BusKill:
 
 			# what did the message from the child say?
 			if queue_message == 'trigger':
-				# the child told us to execute the trigger; do it!
-				self.TRIGGER_FUNCTION()
+				# M5: route through the countdown phase. If self.delay
+				# is 0 the countdown fires immediately; otherwise the
+				# user has self.delay seconds to re-plug to abort. The
+				# countdown runs in a background thread so we return
+				# right away and the Kivy UI stays responsive.
+				self.start_countdown_and_fire()
 				return queue_message
 			else:
 				# no idea what the child said; log it as an error
 				msg = "ERROR: Unknown queue message from child usb_handler"
 				print( msg ); logger.error( msg )
+
+	# --- M5: countdown ----------------------------------------------------
+
+	def start_countdown_and_fire( self ):
+		"""
+		Begin the per-arm countdown. On expiry, calls TRIGGER_FUNCTION
+		(which dispatches to all enabled triggers). Re-detect of an
+		OnlyKey via hidapi during the countdown aborts and skips the
+		trigger.
+
+		Spawns a daemon thread so the caller (typically
+		check_usb_handler on the Kivy main thread) returns immediately.
+		Subsequent calls while the countdown is already running are
+		ignored.
+		"""
+		if self.countdown_active:
+			return
+
+		# Snapshot the delay so changes mid-countdown don't affect us
+		delay = max(0, int(self.delay or 0))
+		self.countdown_active = True
+		self._countdown_aborted = False
+		self.countdown_remaining = delay
+
+		msg = "INFO: Trigger countdown started (delay=" +str(delay)+ "s)"
+		print( msg ); logger.info( msg )
+
+		def loop():
+			try:
+				# hidapi is the only way to abort-on-replug on Windows
+				# without a brand-new HID notification window. We import
+				# it lazily and tolerate its absence.
+				onlykey_check = None
+				try:
+					import hid
+					def _check():
+						return any(
+							d.get('vendor_id') == ONLYKEY_VID
+							and d.get('product_id') == ONLYKEY_PID
+							for d in hid.enumerate()
+						)
+					onlykey_check = _check
+				except Exception:
+					onlykey_check = None
+
+				if delay <= 0:
+					# Instant fire, no countdown
+					self._fire_triggers_now()
+					return
+
+				ticks_per_sec = 10
+				total = delay * ticks_per_sec
+
+				for i in range(total):
+					if i % ticks_per_sec == 0:
+						# Top of each second: beep + update remaining
+						secs_left = delay - (i // ticks_per_sec)
+						self.countdown_remaining = secs_left
+						self._beep_for_countdown(secs_left, delay)
+
+					# Abort check
+					if onlykey_check is not None:
+						try:
+							if onlykey_check():
+								self._countdown_aborted = True
+								msg = "INFO: Countdown ABORTED — OnlyKey re-plugged"
+								print( msg ); logger.info( msg )
+								return
+						except Exception:
+							# hidapi can blip during heavy USB activity;
+							# fail-safe is "no abort" so the trigger
+							# still fires after the delay
+							pass
+
+					time.sleep(1.0 / ticks_per_sec)
+
+				# Delay expired with no abort — fire
+				self.countdown_remaining = 0
+				self._fire_triggers_now()
+			finally:
+				self.countdown_active = False
+				self.countdown_remaining = 0
+
+		t = threading.Thread(target=loop, daemon=True)
+		t.start()
+
+	def _beep_for_countdown( self, secs_left, total_delay ):
+		"""Short, non-blocking beep per countdown second."""
+		if self.OS_NAME_SHORT != 'win':
+			return
+		try:
+			# MessageBeep with MB_ICONINFORMATION (0x40). Non-blocking,
+			# uses Windows' configured alert sound. Good enough for the
+			# 'something is happening' cue; the visual countdown gives
+			# specifics.
+			windll.user32.MessageBeep(0x40)
+		except Exception:
+			pass
+
+	def _fire_triggers_now( self ):
+		"""Call TRIGGER_FUNCTION (which dispatches to enabled triggers)."""
+		if self.TRIGGER_FUNCTION is None:
+			return
+		try:
+			self.TRIGGER_FUNCTION()
+		except Exception as e:
+			msg = "ERROR: trigger dispatch failed: " +str(e)
+			print( msg ); logger.error( msg )
+
+	# --- M6: PIN ----------------------------------------------------------
+	# Stored as PBKDF2-SHA256(plaintext, salt, 200k) in pin.json under
+	# DATA_DIR. No PIN file == no PIN set (anyone can disarm). The
+	# storage scheme mirrors android/state.py so the conceptual model
+	# is the same on both platforms.
+
+	_PIN_ITERS = 200_000
+	_PIN_SALT_BYTES = 16
+
+	def _pin_path( self ):
+		return os.path.join( self.DATA_DIR or '.', 'pin.json' )
+
+	def _pin_hash( self, plaintext, salt ):
+		return hashlib.pbkdf2_hmac(
+			'sha256',
+			plaintext.encode('utf-8'),
+			salt,
+			self._PIN_ITERS,
+		)
+
+	def pin_is_set( self ):
+		try:
+			with open( self._pin_path() ) as f:
+				d = json.load(f)
+			return bool(d.get('salt') and d.get('hash'))
+		except Exception:
+			return False
+
+	def set_pin( self, plaintext ):
+		if not plaintext:
+			try:
+				os.remove( self._pin_path() )
+			except Exception:
+				pass
+			return
+		salt = secrets.token_bytes(self._PIN_SALT_BYTES)
+		digest = self._pin_hash(plaintext, salt)
+		with open( self._pin_path(), 'w' ) as f:
+			json.dump({'salt': salt.hex(), 'hash': digest.hex()}, f)
+
+	def verify_pin( self, plaintext ):
+		try:
+			with open( self._pin_path() ) as f:
+				d = json.load(f)
+			salt = bytes.fromhex(d['salt'])
+			expected = bytes.fromhex(d['hash'])
+		except Exception:
+			# No PIN file -> anyone can disarm
+			return True
+		candidate = self._pin_hash(plaintext, salt)
+		return secrets.compare_digest(candidate, expected)
 
 	# simulates a fake hotplug removal event
 	def simulate_hotplug_removal( self ):
@@ -1515,11 +1699,25 @@ class BusKill:
 	# WINDOWS
 
 	def triggerWin(self):
+		"""
+		Dispatch to all enabled triggers in priority order:
+		  1. lock-screen — fires first, near-instant
+		  2. soft-shutdown — fires after lock so the device is locked
+		     before shutdown begins
+		Falls back to the legacy single-trigger behavior if
+		triggers_enabled is empty (i.e. nothing has explicitly set it).
+		"""
+		# Compute the effective trigger set
+		triggers = set(self.triggers_enabled)
+		if not triggers:
+			# Legacy fallback: use the single self.trigger value
+			triggers.add(self.trigger or 'lock-screen')
 
-		if self.trigger == 'soft-shutdown':
-			self.trigger_softshutdown_win()
-		else:
+		if 'lock-screen' in triggers:
 			self.trigger_lockscreen_win()
+
+		if 'soft-shutdown' in triggers:
+			self.trigger_softshutdown_win()
 
 	def trigger_lockscreen_win(self):
 

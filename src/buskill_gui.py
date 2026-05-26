@@ -88,6 +88,8 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.modalview import ModalView
 from kivy.uix.popup import Popup
+from kivy.uix.textinput import TextInput
+import configparser
 from kivy.uix.togglebutton import ToggleButton
 from kivy.uix.screenmanager import ScreenManager, Screen
 from kivy.uix.actionbar import ActionView
@@ -178,14 +180,7 @@ class MainWindow(Screen):
 
 		# Pre-arm precondition check. Matches the Android UI: refuse to
 		# arm if the OnlyKey isn't currently plugged in, because the
-		# whole point is to detect its REMOVAL. Arming with no key
-		# attached would either trigger on the first random USB event
-		# (legacy any-USB behavior) or never trigger at all.
-		#
-		# We only enforce this when we actually have a reading from the
-		# poll. If HAS_HIDAPI is False or the poll hasn't completed yet,
-		# fall through to legacy behavior so the app doesn't silently
-		# refuse to work.
+		# whole point is to detect its REMOVAL.
 		if not self.bk.is_armed and HAS_HIDAPI and self._onlykey_present is False:
 			self.status.text = (
 				"Can't arm: OnlyKey not detected.\n"
@@ -193,6 +188,29 @@ class MainWindow(Screen):
 			)
 			return
 
+		# M6: if disarming and a PIN is set, require it (unless this
+		# call is the second pass from a verified PIN entry).
+		if (self.bk.is_armed
+				and self.bk.pin_is_set()
+				and not self._pin_verified_this_toggle):
+			self._prompt_pin_to_disarm()
+			return
+
+		# M5: apply the configured delay from the BusKill config
+		if not self.bk.is_armed:
+			try:
+				cfg = configparser.ConfigParser()
+				cfg.read(self.bk.CONF_FILE)
+				if cfg.has_option('buskill', 'delay'):
+					self.bk.delay = int(cfg.get('buskill', 'delay'))
+			except Exception as e:
+				logger.warning("could not read delay from config: " +str(e))
+
+		self._do_toggle()
+
+	def _do_toggle(self):
+		"""Actually flip armed state. Called after preconditions pass
+		(post-PIN-check on disarm, pre-config-load on arm)."""
 		self.bk.toggle()
 
 		if self.bk.is_armed:
@@ -225,11 +243,200 @@ class MainWindow(Screen):
 			# stop checking for messages from the usb_handler child process
 			Clock.unschedule( self.bk.check_usb_handler )
 
+	# --- M6: PIN dialogs ------------------------------------------------
+
+	# Internal flag to let _prompt_pin_to_disarm's callback bypass the
+	# PIN check the second time around (after correct entry).
+	_pin_verified_this_toggle = False
+
+	def _prompt_pin_to_disarm(self):
+		"""Show a modal asking for the disarm PIN. On correct, disarm."""
+		layout = BoxLayout(orientation='vertical', padding=14, spacing=10)
+		layout.add_widget(Label(text='Enter PIN to disarm', font_size='15sp',
+		                        size_hint=(1, 0.25)))
+		tin = TextInput(password=True, multiline=False,
+		                input_filter='int', font_size='28sp',
+		                halign='center', size_hint=(1, 0.35))
+		layout.add_widget(tin)
+		err_lbl = Label(text='', font_size='13sp', size_hint=(1, 0.1),
+		                color=(1, 0.4, 0.4, 1))
+		layout.add_widget(err_lbl)
+		btns = BoxLayout(orientation='horizontal', spacing=8,
+		                 size_hint=(1, 0.3))
+		popup = Popup(title='Disarm', content=layout,
+		              size_hint=(0.75, 0.45), auto_dismiss=False)
+		def submit(_b):
+			pin = tin.text.strip()
+			if not pin:
+				err_lbl.text = 'Enter a PIN'
+				return
+			if not self.bk.verify_pin(pin):
+				err_lbl.text = 'Wrong PIN'
+				tin.text = ''
+				return
+			popup.dismiss()
+			# PIN verified — bypass the check and toggle through
+			self._pin_verified_this_toggle = True
+			try:
+				self.toggle_buskill()
+			finally:
+				self._pin_verified_this_toggle = False
+		cancel_btn = Button(text='Cancel', font_size='14sp')
+		cancel_btn.bind(on_release=lambda _b: popup.dismiss())
+		ok_btn = Button(text='OK', font_size='14sp')
+		ok_btn.bind(on_release=submit)
+		btns.add_widget(cancel_btn)
+		btns.add_widget(ok_btn)
+		layout.add_widget(btns)
+		popup.open()
+
+	def manage_pin(self):
+		"""Open the PIN management dialog (Set / Change / Remove)."""
+		self.nav_drawer.toggle_state()  # close the drawer first
+
+		layout = BoxLayout(orientation='vertical', padding=14, spacing=8)
+		status_lbl = Label(
+			text=('PIN is set. Disarming requires entering it.'
+			      if self.bk.pin_is_set()
+			      else 'No PIN set. Anyone can disarm.'),
+			font_size='14sp', size_hint=(1, 0.25),
+		)
+		layout.add_widget(status_lbl)
+		btns = BoxLayout(orientation='vertical', spacing=8,
+		                 size_hint=(1, 0.55))
+		set_btn = Button(
+			text='Change PIN' if self.bk.pin_is_set() else 'Set PIN',
+			font_size='14sp')
+		clear_btn = Button(text='Remove PIN', font_size='14sp')
+		clear_btn.disabled = not self.bk.pin_is_set()
+		btns.add_widget(set_btn)
+		btns.add_widget(clear_btn)
+		layout.add_widget(btns)
+		close = Button(text='Close', font_size='14sp', size_hint=(1, 0.2))
+		layout.add_widget(close)
+		popup = Popup(title='PIN management', content=layout,
+		              size_hint=(0.8, 0.5), auto_dismiss=False)
+		close.bind(on_release=lambda _b: popup.dismiss())
+		set_btn.bind(on_release=lambda _b: (popup.dismiss(),
+		                                    self._set_pin_flow()))
+		clear_btn.bind(on_release=lambda _b: (popup.dismiss(),
+		                                       self._clear_pin_flow()))
+		popup.open()
+
+	def _set_pin_flow(self):
+		"""Two-step PIN entry: enter, then confirm."""
+		new_pin = {'value': None}
+
+		def step1():
+			lo = BoxLayout(orientation='vertical', padding=14, spacing=10)
+			lo.add_widget(Label(text='Enter a numeric PIN (min 4 digits)',
+			                     font_size='14sp', size_hint=(1, 0.2)))
+			tin = TextInput(password=True, multiline=False,
+			                input_filter='int', font_size='28sp',
+			                halign='center', size_hint=(1, 0.4))
+			lo.add_widget(tin)
+			err = Label(text='', font_size='12sp', size_hint=(1, 0.1),
+			            color=(1, 0.4, 0.4, 1))
+			lo.add_widget(err)
+			btns = BoxLayout(orientation='horizontal', size_hint=(1, 0.3),
+			                  spacing=8)
+			popup = Popup(title='Set PIN', content=lo,
+			              size_hint=(0.8, 0.5), auto_dismiss=False)
+			def submit(_b):
+				p = tin.text.strip()
+				if len(p) < 4:
+					err.text = 'PIN must be at least 4 digits'
+					return
+				new_pin['value'] = p
+				popup.dismiss()
+				step2()
+			cancel = Button(text='Cancel', font_size='14sp')
+			cancel.bind(on_release=lambda _b: popup.dismiss())
+			ok = Button(text='Next', font_size='14sp')
+			ok.bind(on_release=submit)
+			btns.add_widget(cancel)
+			btns.add_widget(ok)
+			lo.add_widget(btns)
+			popup.open()
+
+		def step2():
+			lo = BoxLayout(orientation='vertical', padding=14, spacing=10)
+			lo.add_widget(Label(text='Re-enter to confirm',
+			                     font_size='14sp', size_hint=(1, 0.2)))
+			tin = TextInput(password=True, multiline=False,
+			                input_filter='int', font_size='28sp',
+			                halign='center', size_hint=(1, 0.4))
+			lo.add_widget(tin)
+			err = Label(text='', font_size='12sp', size_hint=(1, 0.1),
+			            color=(1, 0.4, 0.4, 1))
+			lo.add_widget(err)
+			btns = BoxLayout(orientation='horizontal', size_hint=(1, 0.3),
+			                  spacing=8)
+			popup = Popup(title='Confirm PIN', content=lo,
+			              size_hint=(0.8, 0.5), auto_dismiss=False)
+			def submit(_b):
+				if tin.text.strip() != new_pin['value']:
+					err.text = "PINs don't match"
+					tin.text = ''
+					return
+				self.bk.set_pin(new_pin['value'])
+				popup.dismiss()
+			cancel = Button(text='Cancel', font_size='14sp')
+			cancel.bind(on_release=lambda _b: popup.dismiss())
+			ok = Button(text='Save', font_size='14sp')
+			ok.bind(on_release=submit)
+			btns.add_widget(cancel)
+			btns.add_widget(ok)
+			lo.add_widget(btns)
+			popup.open()
+
+		step1()
+
+	def _clear_pin_flow(self):
+		"""Require current PIN to clear it."""
+		lo = BoxLayout(orientation='vertical', padding=14, spacing=10)
+		lo.add_widget(Label(text='Enter current PIN to remove it',
+		                     font_size='14sp', size_hint=(1, 0.2)))
+		tin = TextInput(password=True, multiline=False, input_filter='int',
+		                font_size='28sp', halign='center',
+		                size_hint=(1, 0.4))
+		lo.add_widget(tin)
+		err = Label(text='', font_size='12sp', size_hint=(1, 0.1),
+		            color=(1, 0.4, 0.4, 1))
+		lo.add_widget(err)
+		btns = BoxLayout(orientation='horizontal', size_hint=(1, 0.3),
+		                  spacing=8)
+		popup = Popup(title='Remove PIN', content=lo,
+		              size_hint=(0.8, 0.5), auto_dismiss=False)
+		def submit(_b):
+			if not self.bk.verify_pin(tin.text.strip()):
+				err.text = 'Wrong PIN'
+				tin.text = ''
+				return
+			self.bk.set_pin('')
+			popup.dismiss()
+		cancel = Button(text='Cancel', font_size='14sp')
+		cancel.bind(on_release=lambda _b: popup.dismiss())
+		ok = Button(text='Remove', font_size='14sp')
+		ok.bind(on_release=submit)
+		btns.add_widget(cancel)
+		btns.add_widget(ok)
+		lo.add_widget(btns)
+		popup.open()
+
 	# Live OnlyKey-present poll (1 Hz). Mirrors the headline state in
 	# the Android UI. Updates onlykey_status text + color and dims the
 	# Arm button when the precondition isn't met. No-op if hidapi
 	# isn't available (the indicator will just stay on "checking...").
 	def _poll_onlykey( self, _dt ):
+
+		# M5: if a countdown is in progress, override the indicator
+		# with the live remaining time and red color
+		if getattr(self.bk, 'countdown_active', False):
+			remaining = getattr(self.bk, 'countdown_remaining', 0)
+			self.onlykey_status.text = f"TRIGGER IN {remaining}s"
+			self.onlykey_status.color = (1, 0.3, 0.3, 1)
+			return
 
 		if not HAS_HIDAPI:
 			self.onlykey_status.text = "OnlyKey: (hidapi unavailable)"

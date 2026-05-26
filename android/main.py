@@ -1,25 +1,23 @@
 """
-openCIK Android - M4: device-admin grant flow + lock-screen trigger.
+openCIK Android — M5..M8 build.
 
-Adds on top of M3:
-  - Reads & displays device-admin granted/not-granted state.
-  - "Grant device admin" button that launches the system Settings dialog.
-  - Arm/Disarm toggle. Arming only possible when OnlyKey is present AND
-    device admin is granted. Disarming is unrestricted for now —
-    PIN-gated disarm comes in M6.
-  - Arm state is written to arm.json, which the service reads each tick.
-    On a present->absent transition while armed, the service calls
-    DevicePolicyManager.lockNow().
-  - "Test lock now" button (visible when admin granted) — fires lockNow
-    directly so you can verify the trigger plumbing without unplugging.
+UI is now multi-screen:
+  - MainScreen: OnlyKey status, ARM/DISARM, delay picker, Settings button
+  - SettingsScreen: trigger toggles, PIN management, tampering defenses
+  - PinScreen: set/change PIN (used for disarm gating)
 
-UI structure (top to bottom):
-  - Title
-  - Big arm/disarm button
-  - OnlyKey status
-  - Device admin status + grant button
-  - Service status
-  - USB device list (scrollable)
+Behavior layered in:
+  M5 — configurable per-arm countdown (0/3/5/10 sec) with audio + haptic
+       (the countdown itself lives in service/monitor.py)
+  M6 — PIN-gated disarm
+  M7 — independent trigger toggles (lock / wipe), confirmation-before-wipe
+       toggle
+  M8 — wipe-on-Admin-disable handled in AdminReceiver.java; toggle here
+       (wipe-on-force-stop is intentionally deferred — needs WorkManager
+       scaffolding + has reliability issues under battery saver)
+
+The service does the heavy lifting; this file is the user-facing
+controller + the wipe-confirmation popup handler.
 """
 
 import json
@@ -30,10 +28,18 @@ from kivy.app import App
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
 from kivy.uix.button import Button
+from kivy.uix.togglebutton import ToggleButton
+from kivy.uix.screenmanager import ScreenManager, Screen, NoTransition
+from kivy.uix.popup import Popup
+from kivy.uix.textinput import TextInput
+from kivy.uix.checkbox import CheckBox
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.gridlayout import GridLayout
 from kivy.clock import Clock
 from kivy.utils import platform
+
+# shared state file IO (PIN hashing, settings, arm state)
+import state
 
 
 ONLYKEY_VID = 0x1D50
@@ -42,10 +48,22 @@ ONLYKEY_PID = 0x60FC
 SERVICE_CLASS = 'io.crystalheeler.opencik.ServiceMonitor'
 ADMIN_RECEIVER_CLASS = 'io.crystalheeler.opencik.AdminReceiver'
 
+# Countdown choices on the main screen
+DELAY_CHOICES = [0, 3, 5, 10]
+DEFAULT_DELAY = 3
 
-# -----------------------------------------------------------------------------
-# Pyjnius helpers (no-op on desktop)
-# -----------------------------------------------------------------------------
+# Colors
+COLOR_GREEN = (0.25, 0.85, 0.4, 1)
+COLOR_RED = (0.85, 0.3, 0.3, 1)
+COLOR_AMBER = (1, 0.7, 0.25, 1)
+COLOR_DIM = (0.65, 0.65, 0.65, 1)
+COLOR_WHITE = (1, 1, 1, 1)
+COLOR_NAV_BG = (0.13, 0.59, 0.95, 1)
+
+
+# ============================================================
+# Android API helpers (Pyjnius)
+# ============================================================
 
 def _is_android():
     return platform == 'android'
@@ -59,12 +77,11 @@ def get_activity():
 
 
 def get_context():
-    activity = get_activity()
-    return activity.getApplicationContext() if activity else None
+    a = get_activity()
+    return a.getApplicationContext() if a else None
 
 
-def get_device_policy_manager():
-    """Get Android's DevicePolicyManager system service, or None on desktop."""
+def get_dpm():
     if not _is_android():
         return None
     from jnius import autoclass
@@ -73,7 +90,6 @@ def get_device_policy_manager():
 
 
 def get_admin_component():
-    """Build the ComponentName for our AdminReceiver."""
     if not _is_android():
         return None
     from jnius import autoclass
@@ -82,29 +98,15 @@ def get_admin_component():
 
 
 def is_admin_active():
-    """True iff the user has granted us Device Admin via Settings."""
     if not _is_android():
         return False
     try:
-        dpm = get_device_policy_manager()
-        return bool(dpm.isAdminActive(get_admin_component()))
-    except Exception as e:
-        print(f'[opencik] is_admin_active failed: {e!r}')
+        return bool(get_dpm().isAdminActive(get_admin_component()))
+    except Exception:
         return False
 
 
 def request_admin():
-    """
-    Launch the system 'add device admin' dialog.
-
-    Returns (ok: bool, error: str|None). Caller surfaces errors in UI.
-
-    Implementation note: Pyjnius can't reliably pick the correct
-    putExtra() overload when handing it a ComponentName (it has many
-    overloads, several of which would silently misinterpret the
-    object). The safest path is to use a Bundle with the explicitly-
-    typed putParcelable, then attach the Bundle via putExtras.
-    """
     if not _is_android():
         return False, 'not on android'
     try:
@@ -114,28 +116,22 @@ def request_admin():
         Bundle = autoclass('android.os.Bundle')
 
         intent = Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN)
-
-        component = get_admin_component()
         bundle = Bundle()
         bundle.putParcelable(
             DevicePolicyManager.EXTRA_DEVICE_ADMIN,
-            cast('android.os.Parcelable', component),
+            cast('android.os.Parcelable', get_admin_component()),
         )
         bundle.putString(
             DevicePolicyManager.EXTRA_ADD_EXPLANATION,
             'openCIK needs device-admin access so it can lock (and '
             'optionally factory-reset) the device when your OnlyKey is '
-            'removed while armed. Without this grant, the trigger has '
-            'no way to act.',
+            'removed while armed.',
         )
         intent.putExtras(bundle)
-
         get_activity().startActivity(intent)
         return True, None
     except Exception as e:
-        msg = f'request_admin failed: {e!r}'
-        print(f'[opencik] {msg}')
-        return False, msg
+        return False, repr(e)
 
 
 def request_notification_permission():
@@ -152,225 +148,260 @@ def start_monitor_service():
     if not _is_android():
         return None
     from jnius import autoclass
-    activity = get_activity()
     svc = autoclass(SERVICE_CLASS)
-    svc.start(activity, '')
+    svc.start(get_activity(), '')
     return svc
 
 
-# -----------------------------------------------------------------------------
-# File paths shared with the service
-# -----------------------------------------------------------------------------
+# ============================================================
+# Modal popups
+# ============================================================
 
-def app_files_dir():
-    if not _is_android():
-        return os.path.expanduser('~')
-    return get_activity().getFilesDir().getAbsolutePath()
-
-
-def status_path():
-    return os.path.join(app_files_dir(), 'status.json')
-
-
-def arm_path():
-    return os.path.join(app_files_dir(), 'arm.json')
-
-
-def write_arm_state(armed):
-    payload = {'armed': bool(armed), 'armed_at': time.time() if armed else 0}
-    tmp = arm_path() + '.tmp'
-    with open(tmp, 'w') as f:
-        json.dump(payload, f)
-    os.replace(tmp, arm_path())
+def _modal(title, body, buttons):
+    """
+    Generic modal. `buttons` is a list of (label, callback) tuples.
+    Callbacks receive the popup instance so they can dismiss it.
+    """
+    layout = BoxLayout(orientation='vertical', padding=14, spacing=12)
+    layout.add_widget(Label(text=body, font_size='15sp', halign='center',
+                             valign='middle'))
+    row = BoxLayout(orientation='horizontal', spacing=8, size_hint=(1, 0.4))
+    popup = Popup(title=title, content=layout,
+                   size_hint=(0.85, 0.45), auto_dismiss=False)
+    for label, cb in buttons:
+        btn = Button(text=label, font_size='15sp')
+        btn.bind(on_release=lambda _b, c=cb: c(popup))
+        row.add_widget(btn)
+    layout.add_widget(row)
+    popup.open()
+    return popup
 
 
-def read_arm_state():
-    try:
-        with open(arm_path()) as f:
-            return json.load(f).get('armed', False)
-    except Exception:
-        return False
+class PinPopup(Popup):
+    """Modal that asks for a PIN. Calls `on_ok(pin)` if user submits."""
 
+    def __init__(self, title, body, on_ok, **kw):
+        super().__init__(title=title, size_hint=(0.85, 0.5),
+                          auto_dismiss=False, **kw)
+        self._on_ok = on_ok
 
-# -----------------------------------------------------------------------------
-# Root widget
-# -----------------------------------------------------------------------------
-
-# Colors
-COLOR_GREEN = (0.25, 0.85, 0.4, 1)
-COLOR_RED = (0.85, 0.3, 0.3, 1)
-COLOR_AMBER = (1, 0.7, 0.25, 1)
-COLOR_DIM = (0.65, 0.65, 0.65, 1)
-
-
-class OpenCikRoot(BoxLayout):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.orientation = 'vertical'
-        self.padding = 16
-        self.spacing = 10
-
-        self._status = None  # last parsed status.json
-        self._armed = read_arm_state()
-
-        # --- title ---
-        self.add_widget(Label(
-            text='openCIK',
-            font_size='34sp',
-            bold=True,
-            size_hint=(1, 0.09),
-        ))
-
-        # --- big arm/disarm button ---
-        self.arm_button = Button(
-            text='ARM',
+        root = BoxLayout(orientation='vertical', padding=14, spacing=10)
+        root.add_widget(Label(text=body, font_size='14sp',
+                               size_hint=(1, 0.3)))
+        self.input = TextInput(
+            password=True,
+            multiline=False,
+            input_filter='int',
             font_size='28sp',
-            bold=True,
-            size_hint=(1, 0.18),
-            background_normal='',
-            background_color=COLOR_GREEN,
+            halign='center',
+            size_hint=(1, 0.35),
         )
-        self.arm_button.bind(on_release=self._on_arm_button)
-        self.add_widget(self.arm_button)
+        root.add_widget(self.input)
+        self.error = Label(text='', font_size='13sp', color=COLOR_RED,
+                            size_hint=(1, 0.1))
+        root.add_widget(self.error)
 
-        # --- OnlyKey state ---
-        self.onlykey_label = Label(
-            text='OnlyKey: ...',
-            font_size='20sp',
-            size_hint=(1, 0.07),
-        )
-        self.add_widget(self.onlykey_label)
+        btns = BoxLayout(orientation='horizontal', spacing=8,
+                          size_hint=(1, 0.25))
+        cancel_btn = Button(text='Cancel', font_size='15sp')
+        cancel_btn.bind(on_release=lambda _b: self.dismiss())
+        ok_btn = Button(text='OK', font_size='15sp')
+        ok_btn.bind(on_release=lambda _b: self._submit())
+        btns.add_widget(cancel_btn)
+        btns.add_widget(ok_btn)
+        root.add_widget(btns)
+        self.content = root
 
-        # --- device admin state ---
-        self.admin_label = Label(
-            text='Device admin: ?',
-            font_size='15sp',
-            size_hint=(1, 0.05),
-        )
-        self.add_widget(self.admin_label)
+    def set_error(self, msg):
+        self.error.text = msg
+        self.input.text = ''
 
-        # Grant device admin button (only visible when admin not granted)
-        self.grant_button = Button(
-            text='Grant device admin',
-            font_size='14sp',
-            size_hint=(1, 0.08),
+    def _submit(self):
+        pin = self.input.text.strip()
+        if not pin:
+            self.set_error('Enter a PIN')
+            return
+        self._on_ok(self, pin)
+
+
+# ============================================================
+# Main screen
+# ============================================================
+
+class MainScreen(Screen):
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self._delay = DEFAULT_DELAY
+        self._status = None
+        self._armed_cached = False
+        self._showing_wipe_modal = False
+
+        root = BoxLayout(orientation='vertical', padding=14, spacing=8)
+
+        root.add_widget(Label(text='openCIK', font_size='32sp', bold=True,
+                                size_hint=(1, 0.10)))
+
+        # OnlyKey + admin headline strip
+        self.onlykey_label = Label(text='OnlyKey: ...', font_size='22sp',
+                                     bold=True, size_hint=(1, 0.10))
+        root.add_widget(self.onlykey_label)
+        self.admin_label = Label(text='Device admin: ?', font_size='13sp',
+                                  size_hint=(1, 0.04))
+        root.add_widget(self.admin_label)
+
+        # Delay picker row
+        delay_row = BoxLayout(orientation='horizontal', spacing=4,
+                                size_hint=(1, 0.08))
+        delay_row.add_widget(Label(text='Delay:', font_size='14sp',
+                                     size_hint=(0.25, 1)))
+        self._delay_buttons = {}
+        for d in DELAY_CHOICES:
+            tb = ToggleButton(
+                text=f'{d}s' if d > 0 else 'instant',
+                group='delay', font_size='13sp',
+                state='down' if d == DEFAULT_DELAY else 'normal',
+            )
+            tb.bind(on_release=lambda b, val=d: self._set_delay(val))
+            self._delay_buttons[d] = tb
+            delay_row.add_widget(tb)
+        root.add_widget(delay_row)
+
+        # Big arm/disarm button
+        self.arm_button = Button(
+            text='ARM', font_size='28sp', bold=True,
+            size_hint=(1, 0.20),
+            background_normal='', background_color=COLOR_GREEN,
         )
+        self.arm_button.bind(on_release=self._on_arm)
+        root.add_widget(self.arm_button)
+
+        # Action row: Grant admin / Settings
+        action_row = BoxLayout(orientation='horizontal', spacing=8,
+                                size_hint=(1, 0.08))
+        self.grant_button = Button(text='Grant device admin', font_size='14sp')
         self.grant_button.bind(on_release=self._on_grant)
-        self.add_widget(self.grant_button)
+        action_row.add_widget(self.grant_button)
+        self.settings_button = Button(text='Settings', font_size='14sp')
+        self.settings_button.bind(on_release=self._on_settings)
+        action_row.add_widget(self.settings_button)
+        root.add_widget(action_row)
 
-        # --- service / hint line ---
-        self.svc_label = Label(
-            text='service: ...',
-            font_size='12sp',
-            size_hint=(1, 0.04),
-            color=COLOR_DIM,
-        )
-        self.add_widget(self.svc_label)
+        # Status / hint
+        self.status_label = Label(text='service: starting...',
+                                    font_size='12sp', size_hint=(1, 0.06),
+                                    color=COLOR_DIM)
+        root.add_widget(self.status_label)
 
-        # --- divider ---
-        self.add_widget(Label(
-            text='---- attached USB devices ----',
-            font_size='12sp',
-            size_hint=(1, 0.03),
-            color=COLOR_DIM,
-        ))
-
-        # --- scrollable device list ---
-        scroll = ScrollView(size_hint=(1, 0.39))
+        # Device list
+        root.add_widget(Label(text='---- attached USB ----',
+                                font_size='11sp', size_hint=(1, 0.03),
+                                color=COLOR_DIM))
+        scroll = ScrollView(size_hint=(1, 0.31))
         self.device_grid = GridLayout(cols=1, spacing=4, size_hint_y=None)
         self.device_grid.bind(
-            minimum_height=self.device_grid.setter('height'),
-        )
+            minimum_height=self.device_grid.setter('height'))
         scroll.add_widget(self.device_grid)
-        self.add_widget(scroll)
+        root.add_widget(scroll)
 
-        # Kick off
-        request_notification_permission()
-        try:
-            self.service = start_monitor_service()
-            self.svc_label.text = (
-                'service: started' if self.service else 'service: N/A (desktop)'
-            )
-            self.svc_label.color = COLOR_GREEN if self.service else COLOR_DIM
-        except Exception as e:
-            self.svc_label.text = f'service start failed: {e!r}'
-            self.svc_label.color = COLOR_RED
+        self.add_widget(root)
 
-        self._refresh()
-        Clock.schedule_interval(self._refresh_clock, 1.0)
+    def on_pre_enter(self, *a):
+        self._refresh(None)
+        Clock.schedule_interval(self._refresh, 1.0)
+        Clock.schedule_interval(self._check_wipe_confirmation, 0.3)
+
+    def on_pre_leave(self, *a):
+        Clock.unschedule(self._refresh)
+        Clock.unschedule(self._check_wipe_confirmation)
 
     # --- handlers ---
 
-    def _on_grant(self, _btn):
+    def _set_delay(self, value):
+        self._delay = value
+        # If armed, update arm.json so service sees the new value
+        # next tick (only matters if we're armed; otherwise it's
+        # written at arm time).
+        if state.read_arm()['armed']:
+            state.write_arm(True, delay=value)
+
+    def _on_grant(self, _b):
         ok, err = request_admin()
         if not ok:
-            self.svc_label.text = err or 'grant failed (unknown)'
-            self.svc_label.color = COLOR_RED
+            self.status_label.text = err or 'grant failed'
+            self.status_label.color = COLOR_RED
 
-    def _on_arm_button(self, _btn):
-        if self._armed:
-            # disarm — for M4 unrestricted; PIN gate lands in M6
-            self._armed = False
-            write_arm_state(False)
+    def _on_settings(self, _b):
+        self.manager.transition.direction = 'left'
+        self.manager.current = 'settings'
+
+    def _on_arm(self, _b):
+        armed = state.read_arm()['armed']
+        if armed:
+            self._try_disarm()
         else:
-            # arm only if preconditions met
-            if not self._onlykey_present():
-                self.svc_label.text = (
-                    'cannot arm: OnlyKey must be plugged in first'
-                )
-                self.svc_label.color = COLOR_AMBER
-                return
-            if not is_admin_active():
-                self.svc_label.text = (
-                    'cannot arm: grant device admin first'
-                )
-                self.svc_label.color = COLOR_AMBER
-                return
-            self._armed = True
-            write_arm_state(True)
-        self._refresh()
+            self._try_arm()
 
-    def _refresh_clock(self, _dt):
-        self._refresh()
+    def _try_arm(self):
+        # Preconditions: OnlyKey present, admin granted (always required —
+        # we need admin to fire any trigger), at least one trigger on.
+        if not self._onlykey_present():
+            self.status_label.text = 'Cannot arm: OnlyKey not detected'
+            self.status_label.color = COLOR_AMBER
+            return
+        if not is_admin_active():
+            self.status_label.text = 'Cannot arm: grant device admin first'
+            self.status_label.color = COLOR_AMBER
+            return
+        if not state.any_trigger_enabled():
+            self.status_label.text = ('Cannot arm: no triggers enabled '
+                                       '(open Settings)')
+            self.status_label.color = COLOR_AMBER
+            return
+        state.write_arm(True, delay=self._delay)
+        self._refresh(None)
 
-    # --- helpers ---
+    def _try_disarm(self):
+        if state.pin_is_set():
+            # Pop the PIN modal
+            def on_ok(popup, pin):
+                if state.verify_pin(pin):
+                    state.write_arm(False)
+                    popup.dismiss()
+                    self._refresh(None)
+                else:
+                    popup.set_error('Wrong PIN')
+            PinPopup('Disarm', 'Enter PIN to disarm', on_ok).open()
+        else:
+            state.write_arm(False)
+            self._refresh(None)
+
+    # --- polling ---
 
     def _onlykey_present(self):
-        if not self._status:
-            return False
-        return bool(self._status.get('onlykey_present'))
+        return bool(self._status and self._status.get('onlykey_present'))
 
-    def _refresh(self):
-        # Pull latest service status
+    def _refresh(self, _dt):
         try:
-            with open(status_path()) as f:
+            with open(state._path('status.json')) as f:
                 self._status = json.load(f)
         except Exception:
             self._status = None
 
         admin = is_admin_active()
         onlykey = self._onlykey_present()
+        arm = state.read_arm()
+        armed = arm['armed']
+        self._armed_cached = armed
+        countdown = (self._status or {}).get('countdown_remaining')
 
-        # --- arm button look ---
-        if self._armed:
-            self.arm_button.text = 'DISARM'
-            self.arm_button.background_color = COLOR_RED
-        else:
-            self.arm_button.text = 'ARM'
-            self.arm_button.background_color = COLOR_GREEN
-            # dim when preconditions not met
-            if not (onlykey and admin):
-                self.arm_button.background_color = (
-                    self.arm_button.background_color[0] * 0.45,
-                    self.arm_button.background_color[1] * 0.45,
-                    self.arm_button.background_color[2] * 0.45,
-                    1,
-                )
-
-        # --- OnlyKey label ---
+        # OnlyKey label
         if not _is_android():
             self.onlykey_label.text = 'OnlyKey: N/A (desktop)'
             self.onlykey_label.color = COLOR_DIM
+        elif countdown is not None and countdown > 0:
+            self.onlykey_label.text = f'TRIGGER IN {countdown}s'
+            self.onlykey_label.color = COLOR_RED
         elif onlykey:
             self.onlykey_label.text = 'OnlyKey: PRESENT'
             self.onlykey_label.color = COLOR_GREEN
@@ -378,10 +409,9 @@ class OpenCikRoot(BoxLayout):
             self.onlykey_label.text = 'OnlyKey: absent'
             self.onlykey_label.color = COLOR_AMBER
 
-        # --- admin label ---
+        # Admin label
         if not _is_android():
             self.admin_label.text = 'Device admin: N/A (desktop)'
-            self.admin_label.color = COLOR_DIM
         elif admin:
             self.admin_label.text = 'Device admin: GRANTED'
             self.admin_label.color = COLOR_GREEN
@@ -389,61 +419,302 @@ class OpenCikRoot(BoxLayout):
             self.admin_label.text = 'Device admin: NOT GRANTED'
             self.admin_label.color = COLOR_AMBER
 
-        # Show grant button only when not granted (height collapses too,
-        # via a size_hint trick: 0.08 when visible, 0.001 when hidden)
+        # Grant button visibility
         self.grant_button.opacity = 0 if admin else 1
         self.grant_button.disabled = admin
-        self.grant_button.size_hint = (1, 0.001 if admin else 0.08)
 
-        # --- svc status freshness ---
+        # Arm button look
+        if armed:
+            self.arm_button.text = 'DISARM'
+            self.arm_button.background_color = COLOR_RED
+        else:
+            self.arm_button.text = 'ARM'
+            self.arm_button.background_color = COLOR_GREEN
+            if not (onlykey and admin and state.any_trigger_enabled()):
+                self.arm_button.background_color = (
+                    COLOR_GREEN[0] * 0.45, COLOR_GREEN[1] * 0.45,
+                    COLOR_GREEN[2] * 0.45, 1)
+
+        # Delay picker — disable while armed (it'd be confusing to let
+        # the user change delay mid-arm; the current value is already
+        # committed to arm.json)
+        for d, btn in self._delay_buttons.items():
+            btn.disabled = armed
+            btn.state = 'down' if d == arm.get('delay', self._delay) else 'normal'
+
+        # Service freshness
         if self._status is None:
-            self.svc_label.text = 'service: waiting for first tick...'
-            self.svc_label.color = COLOR_DIM
+            self.status_label.text = 'service: waiting for first tick...'
+            self.status_label.color = COLOR_DIM
         else:
             age = time.time() - self._status.get('ts', 0)
             tick = self._status.get('tick', '?')
             if age > 5:
-                self.svc_label.text = f'⚠ service stale ({age:.1f}s old)'
-                self.svc_label.color = COLOR_AMBER
+                self.status_label.text = f'service stale ({age:.1f}s old)'
+                self.status_label.color = COLOR_AMBER
             else:
-                self.svc_label.text = f'service: live · tick {tick}'
-                self.svc_label.color = COLOR_GREEN
+                self.status_label.text = f'service live · tick {tick}'
+                self.status_label.color = COLOR_GREEN
 
-        # --- device list ---
+        # Device list
         self.device_grid.clear_widgets()
-        devices = (self._status or {}).get('devices', [])
+        devices = (self._status or {}).get('devices', []) or []
         if not devices:
             self.device_grid.add_widget(Label(
                 text='(no USB devices)',
-                font_size='14sp',
-                size_hint_y=None,
-                height=36,
-                color=COLOR_DIM,
-            ))
+                font_size='13sp', size_hint_y=None, height=36,
+                color=COLOR_DIM))
         else:
             for d in devices:
-                is_ok = (
-                    d['vid'] == ONLYKEY_VID and d['pid'] == ONLYKEY_PID
-                )
+                is_ok = (d['vid'] == ONLYKEY_VID
+                          and d['pid'] == ONLYKEY_PID)
                 prefix = '[OnlyKey] ' if is_ok else ''
-                text = (
-                    f"{prefix}{d['product']}\n"
-                    f"VID:{d['vid']:04X}  PID:{d['pid']:04X}"
-                )
                 self.device_grid.add_widget(Label(
-                    text=text,
-                    font_size='13sp',
-                    size_hint_y=None,
-                    height=62,
-                    color=COLOR_GREEN if is_ok else (1, 1, 1, 1),
-                ))
+                    text=(f"{prefix}{d['product']}\n"
+                          f"VID:{d['vid']:04X}  PID:{d['pid']:04X}"),
+                    font_size='13sp', size_hint_y=None, height=58,
+                    color=COLOR_GREEN if is_ok else COLOR_WHITE))
 
+    def _check_wipe_confirmation(self, _dt):
+        """
+        If the service requested a wipe-confirmation, pop a modal
+        asking the user. Reads pending_wipe.json; writes the result
+        back so the service can proceed or cancel.
+        """
+        if self._showing_wipe_modal:
+            return
+        try:
+            with open(state._path('pending_wipe.json')) as f:
+                req = json.load(f)
+        except Exception:
+            return
+        if req.get('state') != 'requested':
+            return
+
+        self._showing_wipe_modal = True
+
+        def confirm(popup):
+            with open(state._path('pending_wipe.json'), 'w') as f:
+                json.dump({'state': 'confirmed', 'ts': time.time()}, f)
+            popup.dismiss()
+            self._showing_wipe_modal = False
+
+        def cancel(popup):
+            with open(state._path('pending_wipe.json'), 'w') as f:
+                json.dump({'state': 'cancelled', 'ts': time.time()}, f)
+            popup.dismiss()
+            self._showing_wipe_modal = False
+
+        _modal(
+            title='CONFIRM FACTORY RESET',
+            body=('OnlyKey trigger fired with wipe enabled.\n\n'
+                  'Tap WIPE to factory-reset this device now.\n'
+                  'Tap Cancel to abort the wipe (lock-screen still '
+                  'fires).'),
+            buttons=[('Cancel', cancel), ('WIPE', confirm)],
+        )
+
+
+# ============================================================
+# Settings screen
+# ============================================================
+
+class SettingsScreen(Screen):
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        root = BoxLayout(orientation='vertical', padding=14, spacing=10)
+
+        # Header
+        header = BoxLayout(orientation='horizontal', size_hint=(1, 0.08))
+        back = Button(text='< Back', font_size='14sp', size_hint=(0.25, 1))
+        back.bind(on_release=lambda _b: self._go_back())
+        header.add_widget(back)
+        header.add_widget(Label(text='Settings', font_size='22sp', bold=True,
+                                  size_hint=(0.75, 1)))
+        root.add_widget(header)
+
+        scroll = ScrollView(size_hint=(1, 0.92))
+        body = GridLayout(cols=1, spacing=10, size_hint_y=None,
+                           padding=(0, 4, 0, 16))
+        body.bind(minimum_height=body.setter('height'))
+
+        # --- Triggers section ---
+        body.add_widget(self._section('TRIGGERS'))
+        self.cb_lock = self._toggle_row(
+            body, 'Lock screen on trigger',
+            'Default ON. Calls DevicePolicyManager.lockNow().',
+            'trig_lock',
+        )
+        self.cb_wipe = self._toggle_row(
+            body, 'Factory wipe on trigger',
+            'DESTRUCTIVE. Default OFF. Wipes the device.',
+            'trig_wipe',
+        )
+        self.cb_confirm = self._toggle_row(
+            body, 'Confirm before wipe',
+            ('Show a confirm popup before wipe fires. Turn ON for '
+             'casual testing; leave OFF for duress.'),
+            'wipe_confirm',
+        )
+
+        # --- Tampering defenses section ---
+        body.add_widget(self._section('TAMPERING DEFENSES'))
+        self.cb_wod = self._toggle_row(
+            body, 'Wipe on Admin disable attempt',
+            ('Fires factory wipe if anyone tries to revoke openCIK\'s '
+             'device-admin permission while armed.'),
+            'wipe_on_admin_disable',
+        )
+        # M8 partial: wipe-on-force-stop is deferred (needs WorkManager
+        # scaffolding). Showing as disabled toggle.
+        row = BoxLayout(orientation='horizontal', size_hint_y=None, height=64)
+        row.add_widget(Label(
+            text=('Wipe on force-stop\n'
+                  '[not yet implemented — coming in later release]'),
+            font_size='13sp', halign='left', valign='middle',
+            text_size=(self.width or 400, None),
+            color=COLOR_DIM, size_hint=(0.8, 1)))
+        cb = CheckBox(size_hint=(0.2, 1), disabled=True)
+        row.add_widget(cb)
+        body.add_widget(row)
+
+        # --- PIN section ---
+        body.add_widget(self._section('PIN GATE'))
+        self.pin_status = Label(
+            text='', font_size='13sp', halign='left', valign='middle',
+            size_hint_y=None, height=34,
+            text_size=(self.width or 400, None))
+        body.add_widget(self.pin_status)
+        pin_row = BoxLayout(orientation='horizontal', spacing=8,
+                              size_hint_y=None, height=48)
+        self.pin_set_btn = Button(text='Set PIN', font_size='14sp')
+        self.pin_set_btn.bind(on_release=lambda _b: self._set_pin_flow())
+        pin_row.add_widget(self.pin_set_btn)
+        self.pin_clear_btn = Button(text='Remove PIN', font_size='14sp')
+        self.pin_clear_btn.bind(on_release=lambda _b: self._clear_pin_flow())
+        pin_row.add_widget(self.pin_clear_btn)
+        body.add_widget(pin_row)
+
+        scroll.add_widget(body)
+        root.add_widget(scroll)
+        self.add_widget(root)
+
+    def _section(self, title):
+        return Label(text=title, font_size='15sp', bold=True,
+                       halign='left', valign='middle',
+                       size_hint_y=None, height=36,
+                       color=COLOR_NAV_BG,
+                       text_size=(self.width or 400, None))
+
+    def _toggle_row(self, parent, title, desc, settings_key):
+        row = BoxLayout(orientation='horizontal', size_hint_y=None, height=72)
+        text = BoxLayout(orientation='vertical', size_hint=(0.8, 1))
+        text.add_widget(Label(text=title, font_size='15sp',
+                                halign='left', valign='bottom',
+                                text_size=(self.width or 400, None),
+                                size_hint=(1, 0.45)))
+        text.add_widget(Label(text=desc, font_size='12sp', color=COLOR_DIM,
+                                halign='left', valign='top',
+                                text_size=(self.width or 400, None),
+                                size_hint=(1, 0.55)))
+        row.add_widget(text)
+        cb = CheckBox(size_hint=(0.2, 1))
+        # Stash the key on the widget so the callback knows which one
+        cb._settings_key = settings_key
+        cb.bind(active=self._on_toggle)
+        row.add_widget(cb)
+        parent.add_widget(row)
+        return cb
+
+    def on_pre_enter(self, *a):
+        # Sync widget states from settings.json
+        s = state.read_settings()
+        self.cb_lock.active = s['trig_lock']
+        self.cb_wipe.active = s['trig_wipe']
+        self.cb_confirm.active = s['wipe_confirm']
+        self.cb_wod.active = s['wipe_on_admin_disable']
+        self._refresh_pin_status()
+
+    def _on_toggle(self, cb, value):
+        s = state.read_settings()
+        s[cb._settings_key] = bool(value)
+        state.write_settings(s)
+
+    def _go_back(self):
+        self.manager.transition.direction = 'right'
+        self.manager.current = 'main'
+
+    # --- PIN flows ---
+
+    def _refresh_pin_status(self):
+        if state.pin_is_set():
+            self.pin_status.text = 'PIN is set. Disarming requires entering it.'
+            self.pin_status.color = COLOR_GREEN
+            self.pin_clear_btn.disabled = False
+        else:
+            self.pin_status.text = 'No PIN set. Anyone can disarm.'
+            self.pin_status.color = COLOR_AMBER
+            self.pin_clear_btn.disabled = True
+
+    def _set_pin_flow(self):
+        # Two-step: enter PIN, then confirm PIN
+        new_pin = {'value': None}
+
+        def on_first(popup, pin):
+            if len(pin) < 4:
+                popup.set_error('PIN must be at least 4 digits')
+                return
+            new_pin['value'] = pin
+            popup.dismiss()
+            PinPopup('Confirm PIN', 'Re-enter your new PIN to confirm',
+                      on_confirm).open()
+
+        def on_confirm(popup, pin):
+            if pin != new_pin['value']:
+                popup.set_error('PINs do not match')
+                return
+            state.set_pin(pin)
+            popup.dismiss()
+            self._refresh_pin_status()
+
+        PinPopup('Set PIN',
+                  'Enter a numeric PIN (min 4 digits). This will be '
+                  'required to disarm openCIK.',
+                  on_first).open()
+
+    def _clear_pin_flow(self):
+        # Require current PIN to clear it
+        def on_ok(popup, pin):
+            if not state.verify_pin(pin):
+                popup.set_error('Wrong PIN')
+                return
+            state.set_pin('')
+            popup.dismiss()
+            self._refresh_pin_status()
+
+        PinPopup('Remove PIN', 'Enter your current PIN to remove it',
+                  on_ok).open()
+
+
+# ============================================================
+# App
+# ============================================================
 
 class OpenCikApp(App):
     title = 'openCIK'
 
     def build(self):
-        return OpenCikRoot()
+        request_notification_permission()
+        try:
+            self.service = start_monitor_service()
+        except Exception as e:
+            print(f'[opencik] service start failed: {e!r}')
+
+        sm = ScreenManager(transition=NoTransition())
+        sm.add_widget(MainScreen(name='main'))
+        sm.add_widget(SettingsScreen(name='settings'))
+        return sm
 
 
 if __name__ == '__main__':
