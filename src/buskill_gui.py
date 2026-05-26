@@ -215,7 +215,7 @@ class MainWindow(Screen):
 
 		if self.bk.is_armed:
 			self.toggle_btn.text = 'Disarm'
-			self.status.text = "BusKill is armed\n"
+			self.status.text = "openCIK is armed\n"
 			self.status.text += "with '" +str(self.bk.trigger)+ "' trigger."
 			self.toggle_btn.background_color = self.color_red
 
@@ -230,7 +230,7 @@ class MainWindow(Screen):
 
 		else:
 			self.toggle_btn.text = 'Arm'
-			self.status.text = "BusKill is disarmed.\n"
+			self.status.text = "openCIK is disarmed.\n"
 			self.toggle_btn.background_color = self.color_primary
 
 			# set the actionview of every actionbar of every screen back to the
@@ -522,11 +522,16 @@ class MainWindow(Screen):
 			self.dialog.open()
 
 	def about_ref_press(self, ref):
+		# Refs in the About body:
+		#   "website"    -> upstream BusKill (attribution)
+		#   "gui_help"   -> openCIK source repo
+		#   "contribute" -> upstream BusKill docs
 		if ref == 'gui_help':
-			return self.webbrowser_open_url( bk.url_documentation_gui )
+			return self.webbrowser_open_url(
+				'https://github.com/crystalheeler/openCIK'
+			)
 		elif ref == 'contribute':
-			return self.webbrowser_open_url( bk.url_documentation_contribute )
-
+			return self.webbrowser_open_url( bk.url_documentation )
 		return self.webbrowser_open_url( bk.url_website )
 
 	def webbrowser_open_url(self, url ):
@@ -539,12 +544,12 @@ class MainWindow(Screen):
 		# first close the navigation drawer
 		self.nav_drawer.toggle_state()
 
-		msg = "For latest news about BusKill, see our website at [ref=website][u]https://buskill.in[/u][/ref]\n\n"
-		msg+= "For help, see our documentation at [ref=gui_help][u]https://docs.buskill.in[/u][/ref]\n\n"
-		msg+= "Want to help? See [ref=contribute][u]contributing[/u][/ref]"
+		msg = "openCIK is an OnlyKey-driven fork of the [ref=website][u]BusKill[/u][/ref] kill cord.\n\n"
+		msg+= "Source: [ref=gui_help][u]github.com/crystalheeler/openCIK[/u][/ref]\n\n"
+		msg+= "Original project documentation: [ref=contribute][u]docs.buskill.in[/u][/ref]"
 
 		self.dialog = DialogConfirmation(
-		 title='BusKill ' +str(BUSKILL_VERSION['VERSION']),
+		 title='openCIK ' +str(BUSKILL_VERSION['VERSION']),
 		 body = msg,
 		 button = "",
 		 continue_function = None,
@@ -586,10 +591,10 @@ class MainWindow(Screen):
 
 		# open a new dialog with a spinning progress circle that tells the user
 		# to wait for upgrade() to finish
-		msg = "Please wait while we check for updates and download the latest version of BusKill."
+		msg = "Please wait while we check for updates and download the latest version of openCIK."
 
 		self.dialog = DialogConfirmation(
-		 title='Updating BusKill',
+		 title='Updating openCIK',
 		 body = msg,
 		 button = "",
 		 continue_function=None,
@@ -674,7 +679,7 @@ class MainWindow(Screen):
 				# open a new dialog that tells the user that they're already
 				# running the latest version
 				self.dialog = DialogConfirmation(
-				 title = '[font=mdicons][size=30]\ue92f[/size][/font] Update BusKill',
+				 title = '[font=mdicons][size=30]\ue92f[/size][/font] Update openCIK',
 				 body = "You're currently using the latest version",
 				 button = "",
 				 continue_function=None
@@ -696,7 +701,7 @@ class MainWindow(Screen):
 
 		# open a new dialog that tells the user that the upgrade() was a
 		# success and gets confirmation from the user to restart the app
-		msg = "BusKill was updated successfully. Please restart this app to continue."
+		msg = "openCIK was updated successfully. Please restart this app to continue."
 		self.dialog = DialogConfirmation(
 		 title = '[font=mdicons][size=30]\ue92f[/size][/font]  Update Successful',
 		 body = msg,
@@ -761,7 +766,7 @@ class MainWindow(Screen):
 				self.dialog.dismiss()
 
 			# open a new dialog that tells the user the error that occurred
-			msg = "Sorry, we were unable to restart the BusKill App. Please execute it manually at the following location.\n\n" + str(new_version_exe)
+			msg = "Sorry, we were unable to restart openCIK. Please execute it manually at the following location.\n\n" + str(new_version_exe)
 			self.dialog = DialogConfirmation(
 			 title = '[font=mdicons][size=30]\ue002[/size][/font] Restart Error',
 			 body = msg,
@@ -1406,6 +1411,12 @@ class DebugLog(Screen):
 
 class BusKillApp(App):
 
+	# Window title. Without this Kivy uses the class name minus "App"
+	# which would show "BusKill" in the OS title bar. We're branded as
+	# openCIK on both Windows and Android — Buskill is the upstream
+	# project this fork is based on; see the About dialog for credit.
+	title = 'openCIK'
+
 	# copied mostly from 'site-packages/kivy/app.py'
 	def __init__(self, bk, **kwargs):
 
@@ -1527,7 +1538,7 @@ class BusKillApp(App):
 			 pystray.MenuItem( 'Quit', self._tray_quit ),
 			)
 			self._tray_icon = pystray.Icon(
-			 'buskill', icon_img, 'BusKill (OnlyKey)', menu
+			 'buskill', icon_img, 'openCIK', menu
 			)
 			# pystray.Icon.run() blocks, so it goes in its own thread.
 			# daemon=True so it dies if the main process is killed.
@@ -1593,7 +1604,13 @@ class BusKillApp(App):
 		Config.read( self.bk.CONF_FILE )
 		Config.setdefaults('buskill', {
 		 'trigger': 'lock-screen',
-		})	
+		 # Default countdown delay (seconds). Must be one of the
+		 # values in settings_buskill.json's "Trigger countdown"
+		 # options ('0', '3', '5', '10'). Without this default the
+		 # Settings panel crashes with NoOptionError when first
+		 # opening Settings on a fresh install.
+		 'delay': '3',
+		})
 		Config.set('kivy', 'exit_on_escape', '0')
 		Config.set('input', 'mouse', 'mouse,multitouch_on_demand')
 		Config.write()
