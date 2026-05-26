@@ -250,16 +250,21 @@ class MainScreen(Screen):
                                   size_hint=(1, 0.04))
         root.add_widget(self.admin_label)
 
-        # Delay picker row
-        delay_row = BoxLayout(orientation='horizontal', spacing=4,
-                                size_hint=(1, 0.08))
-        delay_row.add_widget(Label(text='Delay:', font_size='14sp',
-                                     size_hint=(0.25, 1)))
+        # Delay header label (own row so it isn't squished)
+        root.add_widget(Label(
+            text='Delay before trigger',
+            font_size='13sp', size_hint=(1, 0.04),
+            color=COLOR_DIM,
+        ))
+
+        # Delay picker — 4 toggle buttons across the full row
+        delay_row = BoxLayout(orientation='horizontal', spacing=6,
+                                size_hint=(1, 0.09))
         self._delay_buttons = {}
         for d in DELAY_CHOICES:
             tb = ToggleButton(
                 text=f'{d}s' if d > 0 else 'instant',
-                group='delay', font_size='13sp',
+                group='delay', font_size='14sp',
                 state='down' if d == DEFAULT_DELAY else 'normal',
             )
             tb.bind(on_release=lambda b, val=d: self._set_delay(val))
@@ -276,20 +281,33 @@ class MainScreen(Screen):
         self.arm_button.bind(on_release=self._on_arm)
         root.add_widget(self.arm_button)
 
-        # Action row: Grant admin / Settings
-        action_row = BoxLayout(orientation='horizontal', spacing=8,
-                                size_hint=(1, 0.08))
-        self.grant_button = Button(text='Grant device admin', font_size='14sp')
+        # Grant admin button (full-width). Only visible when admin not
+        # yet granted; collapses to zero height when granted so the
+        # Settings button doesn't shift around.
+        self.grant_button = Button(text='Grant device admin', font_size='14sp',
+                                     size_hint=(1, 0.08))
         self.grant_button.bind(on_release=self._on_grant)
-        action_row.add_widget(self.grant_button)
-        self.settings_button = Button(text='Settings', font_size='14sp')
-        self.settings_button.bind(on_release=self._on_settings)
-        action_row.add_widget(self.settings_button)
-        root.add_widget(action_row)
+        root.add_widget(self.grant_button)
 
-        # Status / hint
-        self.status_label = Label(text='service: starting...',
-                                    font_size='12sp', size_hint=(1, 0.06),
+        # Spacer to push Settings ~half-inch lower than the Arm button
+        root.add_widget(Label(text='', size_hint=(1, 0.06)))
+
+        # Settings button — centered, narrower than full width
+        settings_row = BoxLayout(orientation='horizontal',
+                                   size_hint=(1, 0.09))
+        settings_row.add_widget(Label(text='', size_hint=(0.25, 1)))
+        self.settings_button = Button(text='Settings', font_size='15sp',
+                                        size_hint=(0.5, 1))
+        self.settings_button.bind(on_release=self._on_settings)
+        settings_row.add_widget(self.settings_button)
+        settings_row.add_widget(Label(text='', size_hint=(0.25, 1)))
+        root.add_widget(settings_row)
+
+        # Hidden status label kept around so error/precondition text
+        # has somewhere to land. Tiny font, dim color, no service tick
+        # spam.
+        self.status_label = Label(text='', font_size='12sp',
+                                    size_hint=(1, 0.05),
                                     color=COLOR_DIM)
         root.add_widget(self.status_label)
 
@@ -297,7 +315,7 @@ class MainScreen(Screen):
         root.add_widget(Label(text='---- attached USB ----',
                                 font_size='11sp', size_hint=(1, 0.03),
                                 color=COLOR_DIM))
-        scroll = ScrollView(size_hint=(1, 0.31))
+        scroll = ScrollView(size_hint=(1, 0.18))
         self.device_grid = GridLayout(cols=1, spacing=4, size_hint_y=None)
         self.device_grid.bind(
             minimum_height=self.device_grid.setter('height'))
@@ -437,24 +455,33 @@ class MainScreen(Screen):
 
         # Delay picker — disable while armed (it'd be confusing to let
         # the user change delay mid-arm; the current value is already
-        # committed to arm.json)
+        # committed to arm.json). When armed we sync button state from
+        # arm.json (so the committed value is shown). When NOT armed
+        # we leave button states alone — self._delay is the source of
+        # truth and _set_delay() already updated the buttons via the
+        # ToggleButton group. (The previous version overwrote button
+        # state from arm.json on every poll, making it impossible to
+        # change the picker.)
         for d, btn in self._delay_buttons.items():
             btn.disabled = armed
-            btn.state = 'down' if d == arm.get('delay', self._delay) else 'normal'
+        if armed:
+            committed = arm.get('delay', self._delay)
+            for d, btn in self._delay_buttons.items():
+                btn.state = 'down' if d == committed else 'normal'
 
-        # Service freshness
-        if self._status is None:
-            self.status_label.text = 'service: waiting for first tick...'
-            self.status_label.color = COLOR_DIM
-        else:
+        # Service freshness — only surface a warning if stale; under
+        # normal operation the live tick counter is noise. The
+        # status_label is reserved for error/precondition messages.
+        if self._status is not None:
             age = time.time() - self._status.get('ts', 0)
-            tick = self._status.get('tick', '?')
             if age > 5:
-                self.status_label.text = f'service stale ({age:.1f}s old)'
+                self.status_label.text = (
+                    f'⚠ service stale ({age:.1f}s old)'
+                )
                 self.status_label.color = COLOR_AMBER
-            else:
-                self.status_label.text = f'service live · tick {tick}'
-                self.status_label.color = COLOR_GREEN
+            elif self.status_label.text.startswith('⚠ service stale'):
+                # Came back to life — clear the warning
+                self.status_label.text = ''
 
         # Device list
         self.device_grid.clear_widgets()
@@ -568,23 +595,21 @@ class SettingsScreen(Screen):
         )
         # M8 partial: wipe-on-force-stop is deferred (needs WorkManager
         # scaffolding). Showing as disabled toggle.
-        row = BoxLayout(orientation='horizontal', size_hint_y=None, height=64)
-        row.add_widget(Label(
+        row = BoxLayout(orientation='horizontal', size_hint_y=None, height=72)
+        row.add_widget(self._bind_text_size(Label(
             text=('Wipe on force-stop\n'
                   '[not yet implemented — coming in later release]'),
-            font_size='13sp', halign='left', valign='middle',
-            text_size=(self.width or 400, None),
-            color=COLOR_DIM, size_hint=(0.8, 1)))
+            font_size='12sp', halign='left', valign='middle',
+            color=COLOR_DIM, size_hint=(0.8, 1))))
         cb = CheckBox(size_hint=(0.2, 1), disabled=True)
         row.add_widget(cb)
         body.add_widget(row)
 
         # --- PIN section ---
         body.add_widget(self._section('PIN GATE'))
-        self.pin_status = Label(
+        self.pin_status = self._bind_text_size(Label(
             text='', font_size='13sp', halign='left', valign='middle',
-            size_hint_y=None, height=34,
-            text_size=(self.width or 400, None))
+            size_hint_y=None, height=34))
         body.add_widget(self.pin_status)
         pin_row = BoxLayout(orientation='horizontal', spacing=8,
                               size_hint_y=None, height=48)
@@ -600,24 +625,40 @@ class SettingsScreen(Screen):
         root.add_widget(scroll)
         self.add_widget(root)
 
+    def _bind_text_size(self, lbl):
+        """
+        Make Label.text_size track the widget's actual rendered width
+        so wrap and clip happens against the real on-screen dimensions.
+        Without this, text_size defaults to None (unbounded) or to
+        whatever value we passed at __init__ time (which is 0/fallback
+        before layout has run), producing overflowing or wildly
+        narrow text.
+        """
+        lbl.bind(size=lambda inst, val: setattr(inst, 'text_size', val))
+        return lbl
+
     def _section(self, title):
-        return Label(text=title, font_size='15sp', bold=True,
-                       halign='left', valign='middle',
-                       size_hint_y=None, height=36,
-                       color=COLOR_NAV_BG,
-                       text_size=(self.width or 400, None))
+        return self._bind_text_size(Label(
+            text=title, font_size='15sp', bold=True,
+            halign='left', valign='middle',
+            size_hint_y=None, height=36,
+            color=COLOR_NAV_BG,
+        ))
 
     def _toggle_row(self, parent, title, desc, settings_key):
-        row = BoxLayout(orientation='horizontal', size_hint_y=None, height=72)
-        text = BoxLayout(orientation='vertical', size_hint=(0.8, 1))
-        text.add_widget(Label(text=title, font_size='15sp',
-                                halign='left', valign='bottom',
-                                text_size=(self.width or 400, None),
-                                size_hint=(1, 0.45)))
-        text.add_widget(Label(text=desc, font_size='12sp', color=COLOR_DIM,
-                                halign='left', valign='top',
-                                text_size=(self.width or 400, None),
-                                size_hint=(1, 0.55)))
+        row = BoxLayout(orientation='horizontal', size_hint_y=None, height=80)
+        text = BoxLayout(orientation='vertical', size_hint=(0.8, 1),
+                          padding=(0, 4, 8, 4))
+        text.add_widget(self._bind_text_size(Label(
+            text=title, font_size='15sp',
+            halign='left', valign='bottom',
+            size_hint=(1, 0.4),
+        )))
+        text.add_widget(self._bind_text_size(Label(
+            text=desc, font_size='11sp', color=COLOR_DIM,
+            halign='left', valign='top',
+            size_hint=(1, 0.6),
+        )))
         row.add_widget(text)
         cb = CheckBox(size_hint=(0.2, 1))
         # Stash the key on the widget so the callback knows which one
