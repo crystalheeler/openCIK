@@ -473,6 +473,21 @@ class BusKill:
 			# on MacOS, the exe lives in the same dir with all our other src files
 			self.SRC_DIR = self.EXE_DIR
 
+		# When running as a PyInstaller --onefile bundle, the EXE_DIR
+		# is wherever the user dropped the .exe (e.g. Downloads), but
+		# our bundled resources (settings_buskill.json, the icon,
+		# packages/, fonts, etc.) are extracted to sys._MEIPASS at
+		# startup. SRC_DIR is the path callers use to find bundled
+		# resources, so it must point at the MEIPASS extract dir, not
+		# at EXE_DIR. Without this fix, clicking Settings throws
+		# FileNotFoundError on packages/buskill/settings_buskill.json.
+		#
+		# Linux happens to already work correctly because its branch
+		# above uses sys.path[0], which under PyInstaller --onefile
+		# resolves to sys._MEIPASS.
+		if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+			self.SRC_DIR = sys._MEIPASS
+
 		# normally the BusKill app is built into a platform-specific executable with
 		# PyInstaller. But if we're executing it directly as a script, then some of
 		# the logic will change throught the app
