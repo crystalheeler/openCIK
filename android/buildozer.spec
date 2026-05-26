@@ -16,11 +16,24 @@ source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,ttf
 
 # (str) Application versioning (method 1)
-version = 0.1.0
+version = 0.3.1
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy
-requirements = python3,kivy
+# pyjnius is the Python -> Java bridge we use to call Android's
+# UsbManager / DevicePolicyManager / NotificationManager. It's usually
+# pulled in transitively by kivy on Android, but listed explicitly so
+# we don't depend on that staying true across p4a versions.
+requirements = python3,kivy,pyjnius
+
+# (list) Background services to register.
+# Format: name:script_path:foreground|background
+# Foreground services keep running when the activity is backgrounded,
+# but require a persistent notification (Android shows one
+# automatically; p4a's template handles that for us).
+# The 'monitor' entry generates a Java class
+# io.crystalheeler.opencik.ServiceMonitor which we start from main.py.
+services = monitor:service/monitor.py:foreground
 
 # (str) Supported orientations
 # Valid options are: landscape, portrait, portrait-reverse or landscape-reverse
@@ -33,11 +46,15 @@ fullscreen = 0
 # --- ANDROID-SPECIFIC ---
 
 # (list) Permissions
-# For the hello-world step we ship zero permissions. Real openCIK will add:
-#   - WAKE_LOCK, FOREGROUND_SERVICE (background USB monitoring)
-#   - BIND_DEVICE_ADMIN (lock/wipe)
-#   - POST_NOTIFICATIONS (Android 13+ persistent notification)
-# android.permissions = INTERNET
+# - FOREGROUND_SERVICE / FOREGROUND_SERVICE_SPECIAL_USE: required to
+#   run our USB-monitoring foreground service on Android 9+ / 14+
+# - WAKE_LOCK: keep CPU running while the service polls (1Hz, very low
+#   power, but Android still demands the permission)
+# - POST_NOTIFICATIONS: Android 13+ requires this to show the
+#   mandatory persistent foreground-service notification
+# Later milestones will add: BIND_DEVICE_ADMIN (lock/wipe trigger),
+# RECEIVE_BOOT_COMPLETED (auto-arm at boot, optional).
+android.permissions = FOREGROUND_SERVICE, FOREGROUND_SERVICE_SPECIAL_USE, WAKE_LOCK, POST_NOTIFICATIONS
 
 # (int) Target Android API, should be as high as possible.
 android.api = 33
